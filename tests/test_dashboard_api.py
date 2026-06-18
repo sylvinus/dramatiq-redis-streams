@@ -1,10 +1,9 @@
 """Tests for the dashboard data-layer functions."""
 
 import dramatiq
-import pytest
 
 from dramatiq_redis_streams.dashboard import api
-from dramatiq_redis_streams.keys import delayed_key, dlq_stream_key, stream_key
+from dramatiq_redis_streams.keys import dlq_stream_key, stream_key
 
 
 def make_message(queue="test-queue", actor="test-actor", args=(), kwargs=None):
@@ -54,6 +53,32 @@ class TestGetOverview:
         broker.enqueue(msg, delay=60000)
         result = api.get_overview(redis_client, broker.namespace, broker.get_declared_queues())
         assert result["delayed_count"] == 1
+
+    def test_processed_and_lag_fields(self, broker, redis_client):
+        """`processed` counts acked messages; `lag` counts undelivered ones."""
+        broker.declare_queue("work")
+        broker.enqueue(make_message(queue="work"))
+        broker.enqueue(make_message(queue="work"))
+
+        consumer = broker.consume("work", prefetch=1, timeout=1000)
+        msg = next(consumer)
+        consumer.ack(msg)
+
+        result = api.get_overview(redis_client, broker.namespace, broker.get_declared_queues())
+        q = next(q for q in result["queues"] if q["name"] == "work")
+        # One message acked → processed == 1; one never delivered → lag == 1.
+        assert q["processed"] == 1
+        assert q["lag"] == 1
+
+        consumer.close()
+
+    def test_lag_is_none_without_consumer_group(self, broker, redis_client):
+        """With no consumer group yet, lag is unavailable → reported as None."""
+        broker.declare_queue("work")
+        broker.enqueue(make_message(queue="work"))  # creates stream, no group
+        result = api.get_overview(redis_client, broker.namespace, broker.get_declared_queues())
+        q = next(q for q in result["queues"] if q["name"] == "work")
+        assert q["lag"] is None
 
     def test_discovers_undeclared_queues(self, broker, redis_client):
         """Queues created by other processes are discovered via SCAN."""
@@ -235,6 +260,47 @@ class TestGetWorkers:
         c2.ack(m2)
         c1.close()
         c2.close()
+
+    def test_pending_messages_are_capped(self, broker, redis_client):
+        """Detail list is capped while aggregate counts stay exact."""
+        broker.declare_queue("work")
+        for i in range(25):
+            broker.enqueue(make_message(queue="work", actor=f"a{i}"))
+        consumer = broker.consume("work", prefetch=25, timeout=1000)
+        msgs = [next(consumer) for _ in range(25)]
+
+        result = api.get_workers(
+            redis_client, broker.namespace, broker.get_declared_queues(),
+            pending_limit=10,
+        )
+        worker = next(w for w in result if w["name"].startswith("worker-"))
+        # Aggregate count reflects everything the worker owns...
+        assert worker["total_pending"] == 25
+        # ...but the detail list is capped.
+        assert len(worker["pending_messages"]) == 10
+        assert worker["pending_messages"][0]["actor"].startswith("a")
+
+        for m in msgs:
+            consumer.ack(m)
+        consumer.close()
+
+    def test_pending_limit_zero(self, broker, redis_client):
+        """pending_limit=0 skips the expensive detail fetch entirely."""
+        broker.declare_queue("work")
+        broker.enqueue(make_message(queue="work"))
+        consumer = broker.consume("work", prefetch=1, timeout=1000)
+        msg = next(consumer)
+
+        result = api.get_workers(
+            redis_client, broker.namespace, broker.get_declared_queues(),
+            pending_limit=0,
+        )
+        worker = next(w for w in result if w["name"].startswith("worker-"))
+        assert worker["total_pending"] == 1
+        assert worker["pending_messages"] == []
+
+        consumer.ack(msg)
+        consumer.close()
 
     def test_no_pending_after_ack(self, broker, redis_client):
         """After acking, pending count drops to zero."""

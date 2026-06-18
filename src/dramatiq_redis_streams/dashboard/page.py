@@ -112,11 +112,58 @@ HTML_PAGE = """\
     return new Date(ts).toLocaleString();
   }
 
+  // Per-queue history of cumulative-processed samples, used to derive a
+  // processing rate smoothed over the last minute. { queue: [{processed, t}] }
+  var RATE_WINDOW_MS = 60000;
+  var rateHistory = {};
+
+  function computeRate(name, processed, now) {
+    var hist = rateHistory[name] || (rateHistory[name] = []);
+    hist.push({ processed: processed, t: now });
+    // Keep roughly the last minute of samples (always keep at least 2).
+    var cutoff = now - RATE_WINDOW_MS;
+    while (hist.length > 2 && hist[0].t < cutoff) hist.shift();
+    var first = hist[0];
+    if (now <= first.t) return null;
+    var dp = processed - first.processed;
+    var dt = (now - first.t) / 1000;
+    if (dp < 0 || dt <= 0) return null;  // counter reset (flush / new group)
+    return dp / dt;
+  }
+
+  function fmtRate(r) {
+    if (r === null) return '<span style="color:#b2bec3">—</span>';
+    if (r === 0) return '0/s';
+    if (r < 10) return r.toFixed(1) + '/s';
+    return Math.round(r) + '/s';
+  }
+
+  // Backlog (consumer-group lag) is the count of messages enqueued but not yet
+  // delivered to any worker. Redis reports it as null right after a flush.
+  function fmtBacklog(n) {
+    if (n === null || n === undefined) return '<span style="color:#b2bec3">—</span>';
+    return n;
+  }
+
   function renderOverview(data) {
+    var now = Date.now();
+    var totalRate = null;
+    data.queues.forEach(function(q) {
+      var rate = computeRate(q.name, q.processed, now);
+      q._rate = rate;
+      if (rate !== null) totalRate = (totalRate || 0) + rate;
+    });
+
     var h = '<div class="stats">';
     var totalDlq = 0;
-    data.queues.forEach(function(q) { totalDlq += q.dlq_length; });
+    var totalBacklog = null;
+    data.queues.forEach(function(q) {
+      totalDlq += q.dlq_length;
+      if (q.lag !== null && q.lag !== undefined) totalBacklog = (totalBacklog || 0) + q.lag;
+    });
     h += '<div class="stat-card"><div class="value">' + data.queues.length + '</div><div class="label">Queues</div></div>';
+    h += '<div class="stat-card" title="Messages enqueued but not yet delivered to a worker"><div class="value">' + fmtBacklog(totalBacklog) + '</div><div class="label">Backlog</div></div>';
+    h += '<div class="stat-card" title="Acked messages per second, averaged over the last minute"><div class="value">' + fmtRate(totalRate) + '</div><div class="label">Throughput (1m avg)</div></div>';
     h += '<div class="stat-card"><div class="value">' + data.delayed_count + '</div><div class="label">Delayed</div></div>';
     h += '<div class="stat-card"><div class="value">' + totalDlq + '</div><div class="label">Dead Letters</div></div>';
     h += '</div>';
@@ -124,13 +171,15 @@ HTML_PAGE = """\
       h += '<div class="empty">No queues found.</div>';
       return h;
     }
-    h += '<table><tr><th>Queue</th><th>Stream Length</th><th>Consumers</th><th>Pending</th><th>DLQ</th><th>Actions</th></tr>';
+    h += '<table><tr><th>Queue</th><th>Stream Length</th><th>Consumers</th><th title="Enqueued, not yet delivered to a worker">Backlog</th><th title="Delivered to a worker, not yet acked">Pending</th><th>Rate</th><th>DLQ</th><th>Actions</th></tr>';
     data.queues.forEach(function(q) {
       h += '<tr>';
       h += '<td><a href="#/queue/' + encodeURIComponent(q.name) + '">' + esc(q.name) + '</a></td>';
       h += '<td>' + q.stream_length + '</td>';
       h += '<td>' + q.consumers + '</td>';
+      h += '<td>' + fmtBacklog(q.lag) + '</td>';
       h += '<td>' + q.pending + '</td>';
+      h += '<td>' + fmtRate(q._rate) + '</td>';
       h += '<td>' + (q.dlq_length > 0 ? '<a href="#/queue/' + encodeURIComponent(q.name) + '/dlq"><span class="badge badge-red">' + q.dlq_length + '</span></a>' : '<span class="badge badge-gray">0</span>') + '</td>';
       h += '<td><button class="btn btn-danger" onclick="flushQueue(\\'' + esc(q.name) + '\\')">Flush</button></td>';
       h += '</tr>';
@@ -245,7 +294,12 @@ HTML_PAGE = """\
           h += '<td>' + pm.deliveries + '</td>';
           h += '</tr>';
         });
-        h += '</table></div>';
+        h += '</table>';
+        if (w.total_pending > w.pending_messages.length) {
+          h += '<div style="font-size:12px;color:#636e72;margin-top:6px">Showing ' +
+               w.pending_messages.length + ' of ' + w.total_pending + ' pending messages.</div>';
+        }
+        h += '</div>';
       }
       h += '</div>';
     });

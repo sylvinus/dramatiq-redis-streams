@@ -67,12 +67,21 @@ class StreamsBroker(dramatiq.Broker):
     # ------------------------------------------------------------------
 
     def declare_queue(self, queue_name):
+        """Register a queue. Purely in-memory — performs no Redis I/O.
+
+        Dramatiq calls this at import time when ``@actor`` declares an actor,
+        so it must not require a live Redis connection. The Redis consumer
+        group is created lazily in :meth:`consume` (i.e. at worker startup),
+        which is the only place it is actually needed. Because groups are
+        created at id ``"0"``, messages enqueued before any consumer starts
+        are still delivered.
+
+        Note: unlike the reference brokers, no ``.DQ`` delay queue is declared
+        — see :meth:`get_declared_delay_queues`.
+        """
         if queue_name not in self.queues:
             self.emit_before("declare_queue", queue_name)
             self.queues.add(queue_name)
-            self.delay_queues.add(f"{queue_name}.DQ")
-            self._ensure_group(stream_key(queue_name, self.namespace))
-            self._ensure_group(stream_key(f"{queue_name}.DQ", self.namespace))
             self.emit_after("declare_queue", queue_name)
 
     def enqueue(self, message, *, delay=None):
@@ -97,6 +106,9 @@ class StreamsBroker(dramatiq.Broker):
 
     def consume(self, queue_name, prefetch=1, timeout=30000):
         self.declare_queue(queue_name)
+        # Create the consumer group lazily, here at worker startup — not in
+        # declare_queue — so that importing task modules never needs Redis.
+        self._ensure_group(stream_key(queue_name, self.namespace))
         self._start_scheduler()
         return StreamsConsumer(
             broker=self,
@@ -148,7 +160,20 @@ class StreamsBroker(dramatiq.Broker):
         return self.queues.copy()
 
     def get_declared_delay_queues(self):
-        return self.delay_queues.copy()
+        """Always empty by design.
+
+        The reference Dramatiq brokers store delayed/retried messages on a
+        per-queue ``<queue>.DQ`` queue that the Worker consumes (and a dispatch
+        step moves due messages back to the canonical queue). This broker
+        instead handles delays with a single ``<namespace>:delayed`` sorted set
+        drained by :class:`~dramatiq_redis_streams.delayed.DelayedScheduler`,
+        which re-adds due messages straight to the main stream.
+
+        Returning an empty set therefore stops the Worker from spawning idle
+        ``.DQ`` consumer threads (and creating empty ``.DQ`` streams/groups)
+        that would never receive a message.
+        """
+        return set()
 
     def close(self):
         if self._scheduler is not None:

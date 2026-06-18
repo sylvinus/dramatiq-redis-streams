@@ -1,7 +1,6 @@
 """Standalone launcher: ``python -m dramatiq_redis_streams.dashboard``."""
 
 import argparse
-import sys
 from wsgiref.simple_server import make_server
 
 from dramatiq_redis_streams import StreamsBroker

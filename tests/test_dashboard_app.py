@@ -5,7 +5,7 @@ from io import BytesIO
 
 import dramatiq
 
-from dramatiq_redis_streams.dashboard.app import DashboardApp
+from dramatiq_redis_streams.dashboard.app import _MAX_PENDING_DETAIL, DashboardApp
 from dramatiq_redis_streams.keys import dlq_stream_key
 
 
@@ -19,12 +19,12 @@ def make_message(queue="test-queue", actor="test-actor", args=(), kwargs=None):
     )
 
 
-def _request(app, method, path, body=None):
+def _request(app, method, path, body=None, query=""):
     """Simulate a WSGI request and return (status_code, headers, body_bytes)."""
     environ = {
         "REQUEST_METHOD": method,
         "PATH_INFO": path,
-        "QUERY_STRING": "",
+        "QUERY_STRING": query,
         "SERVER_NAME": "localhost",
         "SERVER_PORT": "8080",
         "HTTP_HOST": "localhost:8080",
@@ -184,6 +184,37 @@ class TestWorkersAPI:
 
         consumer.ack(msg)
         consumer.close()
+
+    def test_pending_param_is_clamped(self, broker):
+        """An over-large ?pending value is capped at the hard ceiling."""
+        n = _MAX_PENDING_DETAIL + 50
+        broker.declare_queue("work")
+        for i in range(n):
+            broker.enqueue(make_message(queue="work", actor=f"a{i}"))
+        consumer = broker.consume("work", prefetch=n, timeout=1000)
+        msgs = [next(consumer) for _ in range(n)]
+
+        app = DashboardApp(broker)
+        status, _headers, body = _request(
+            app, "GET", "/api/workers", query="pending=100000",
+        )
+        assert status == 200
+        worker = next(w for w in json.loads(body) if w["name"].startswith("worker-"))
+        assert worker["total_pending"] == n                          # aggregate stays exact
+        assert len(worker["pending_messages"]) == _MAX_PENDING_DETAIL  # detail hard-capped
+
+        for m in msgs:
+            consumer.ack(m)
+        consumer.close()
+
+    def test_bad_pending_param_falls_back(self, broker):
+        """A non-numeric ?pending value falls back to the default, not a 500."""
+        app = DashboardApp(broker)
+        status, _headers, body = _request(
+            app, "GET", "/api/workers", query="pending=abc",
+        )
+        assert status == 200
+        assert json.loads(body) == []
 
 
 class TestRouting:

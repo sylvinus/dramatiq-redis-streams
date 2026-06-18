@@ -5,7 +5,7 @@ import dramatiq
 import pytest
 
 from dramatiq_redis_streams import StreamsBroker
-from dramatiq_redis_streams.keys import dlq_stream_key, stream_key
+from dramatiq_redis_streams.keys import dlq_stream_key
 
 from .conftest import make_message
 

@@ -65,11 +65,21 @@ def get_overview(client, namespace, declared_queues=()):
 
         consumers = 0
         pending = 0
+        entries_read = 0
+        # ``lag`` (undelivered backlog) stays None unless Redis reports a usable
+        # value — it goes unavailable right after deletions such as a flush.
+        lag = None
         try:
             groups = client.xinfo_groups(sk)
             for g in groups:
                 consumers += g.get("consumers", 0)
                 pending += g.get("pending", 0)
+                er = g.get("entries-read")
+                if er is not None:
+                    entries_read += er
+                lg = g.get("lag")
+                if lg is not None:
+                    lag = (lag or 0) + lg
         except Exception:
             pass
 
@@ -78,12 +88,17 @@ def get_overview(client, namespace, declared_queues=()):
         except Exception:
             dlq_length = 0
 
+        # ``processed`` is the cumulative number of acked messages
+        # (delivered minus still-pending). Sampling it over time on the client
+        # yields the queue's processing rate without any server-side state.
         queues.append({
             "name": name,
             "stream_length": length,
             "consumers": consumers,
             "pending": pending,
             "dlq_length": dlq_length,
+            "lag": lag,
+            "processed": max(0, entries_read - pending),
         })
 
     try:
@@ -194,12 +209,86 @@ def flush_queue(client, namespace, queue_name):
         pass
 
 
-def get_workers(client, namespace, declared_queues=()):
+def _worker_pending_messages(client, namespace, wname, queue_info, limit):
+    """Fetch up to ``limit`` pending message details for a single worker.
+
+    The per-message detail list is purely informational, so it is capped at
+    ``limit`` entries regardless of how many messages the worker actually owns.
+    Message bodies (for the actor name) are decoded with a single pipeline
+    round-trip instead of one ``XRANGE`` per message — critical when a worker
+    holds tens of thousands of pending messages.
+    """
+    if limit <= 0:
+        return []
+
+    # Collect up to `limit` pending entries across the worker's queues. XPENDING
+    # itself already returns idle time and delivery count cheaply.
+    collected = []  # (qname, stream_key, msg_id, idle_ms, deliveries)
+    for qname, qinfo in queue_info.items():
+        if qinfo["pending"] == 0 or len(collected) >= limit:
+            continue
+        sk = stream_key(qname, namespace)
+        try:
+            details = client.xpending_range(
+                sk, GROUP_NAME, min="-", max="+",
+                count=limit - len(collected), consumername=wname,
+            )
+        except Exception:
+            continue
+        for entry in details:
+            msg_id = entry.get("message_id", b"")
+            if isinstance(msg_id, bytes):
+                msg_id = msg_id.decode()
+            collected.append((
+                qname, sk, msg_id,
+                entry.get("time_since_delivered", 0),
+                entry.get("times_delivered", 1),
+            ))
+            if len(collected) >= limit:
+                break
+
+    if not collected:
+        return []
+
+    # Decode all actor names in one pipeline round-trip.
+    pipe = client.pipeline(transaction=False)
+    for _qname, sk, msg_id, _idle, _deliv in collected:
+        pipe.xrange(sk, min=msg_id, max=msg_id, count=1)
+    try:
+        bodies = pipe.execute()
+    except Exception:
+        bodies = [None] * len(collected)
+
+    pending_messages = []
+    for (qname, _sk, msg_id, idle_ms, deliveries), body in zip(collected, bodies):
+        actor = "<unknown>"
+        try:
+            if body:
+                _, edata = body[0]
+                raw = edata.get(b"data") or edata.get("data")
+                if isinstance(raw, str):
+                    raw = raw.encode("utf-8")
+                actor = dramatiq.Message.decode(raw).actor_name
+        except Exception:
+            pass
+        pending_messages.append({
+            "id": msg_id,
+            "queue": qname,
+            "actor": actor,
+            "idle_ms": idle_ms,
+            "deliveries": deliveries,
+        })
+    return pending_messages
+
+
+def get_workers(client, namespace, declared_queues=(), pending_limit=20):
     """Return a list of workers with per-queue consumer info.
 
     Calls ``XINFO CONSUMERS`` on every discovered queue stream and aggregates
-    the results by consumer (worker) name.  Each worker entry also includes
-    the pending messages it currently owns (via ``XPENDING``).
+    the results by consumer (worker) name. Aggregate counts (``total_pending``
+    and per-queue ``pending``) are always exact. The per-worker
+    ``pending_messages`` detail list is capped at ``pending_limit`` entries to
+    keep the endpoint responsive when workers own large backlogs.
     """
     queue_names = _discover_queues(client, namespace, declared_queues)
 
@@ -245,47 +334,9 @@ def get_workers(client, namespace, declared_queues=()):
         else:
             status = "stale"
 
-        # Fetch the actual pending messages this worker owns.
-        pending_messages = []
-        for qname, qinfo in queue_info.items():
-            if qinfo["pending"] == 0:
-                continue
-            sk = stream_key(qname, namespace)
-            try:
-                details = client.xpending_range(
-                    sk, GROUP_NAME, min="-", max="+",
-                    count=qinfo["pending"], consumername=wname,
-                )
-            except Exception:
-                continue
-            for entry in details:
-                msg_id = entry.get("message_id", b"")
-                if isinstance(msg_id, bytes):
-                    msg_id = msg_id.decode()
-                time_since = entry.get("time_since_delivered", 0)
-                delivery_count = entry.get("times_delivered", 1)
-
-                # Try to decode the actual message body.
-                actor = None
-                try:
-                    msgs = client.xrange(sk, min=msg_id, max=msg_id, count=1)
-                    if msgs:
-                        _, edata = msgs[0]
-                        raw = edata.get(b"data") or edata.get("data")
-                        if isinstance(raw, str):
-                            raw = raw.encode("utf-8")
-                        m = dramatiq.Message.decode(raw)
-                        actor = m.actor_name
-                except Exception:
-                    pass
-
-                pending_messages.append({
-                    "id": msg_id,
-                    "queue": qname,
-                    "actor": actor or "<unknown>",
-                    "idle_ms": time_since,
-                    "deliveries": delivery_count,
-                })
+        pending_messages = _worker_pending_messages(
+            client, namespace, wname, queue_info, pending_limit,
+        )
 
         result.append({
             "name": wname,

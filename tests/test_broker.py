@@ -21,31 +21,49 @@ def _group_names(redis_client, key):
 # ---------------------------------------------------------------------------
 
 class TestDeclareQueue:
-    def test_creates_stream_and_group(self, broker, redis_client):
-        broker.declare_queue("test-queue")
-        names = _group_names(redis_client, stream_key("test-queue"))
-        assert GROUP_NAME.encode() in names or GROUP_NAME in names
+    def test_does_not_touch_redis(self, broker, redis_client):
+        """Declaring a queue is purely in-memory — no eager Redis I/O.
 
-    def test_creates_delay_queue_stream(self, broker, redis_client):
+        This is what lets task modules be imported (which declares actors and
+        thus queues) without a running Redis.
+        """
         broker.declare_queue("test-queue")
-        names = _group_names(redis_client, stream_key("test-queue.DQ"))
-        assert GROUP_NAME.encode() in names or GROUP_NAME in names
+        # Neither the stream nor the consumer group is created yet.
+        assert not redis_client.exists(stream_key("test-queue"))
+        assert not redis_client.exists(stream_key("test-queue.DQ"))
 
-    def test_idempotent(self, broker, redis_client):
+    def test_idempotent(self, broker):
         broker.declare_queue("test-queue")
         broker.declare_queue("test-queue")  # should not raise
-        names = _group_names(redis_client, stream_key("test-queue"))
-        assert len(names) == 1
+        assert "test-queue" in broker.queues
 
     def test_adds_to_queues_set(self, broker):
         broker.declare_queue("test-queue")
         assert "test-queue" in broker.queues
 
-    def test_multiple_queues(self, broker, redis_client):
+    def test_multiple_queues(self, broker):
         for name in ["alpha", "beta", "gamma"]:
             broker.declare_queue(name)
-        for name in ["alpha", "beta", "gamma"]:
-            assert redis_client.exists(stream_key(name))
+        assert {"alpha", "beta", "gamma"} <= broker.queues
+
+
+class TestConsumeCreatesGroup:
+    def test_consume_creates_group(self, broker, redis_client):
+        """The consumer group is created lazily at consume() time."""
+        consumer = broker.consume("test-queue", timeout=100)
+        names = _group_names(redis_client, stream_key("test-queue"))
+        assert GROUP_NAME.encode() in names or GROUP_NAME in names
+        consumer.close()
+
+    def test_messages_enqueued_before_consumer_are_delivered(self, broker, redis_client):
+        """Group is created at id "0", so pre-consumer messages aren't lost."""
+        broker.enqueue(make_message(actor="early"))
+        consumer = broker.consume("test-queue", timeout=1000)
+        proxy = next(consumer)
+        assert proxy is not None
+        assert proxy.actor_name == "early"
+        consumer.ack(proxy)
+        consumer.close()
 
 
 # ---------------------------------------------------------------------------
@@ -158,9 +176,12 @@ class TestGetDeclaredQueues:
         qs.add("phantom")
         assert "phantom" not in broker.queues
 
-    def test_delay_queues(self, broker):
+    def test_no_delay_queues_declared(self, broker):
+        """This broker manages delays via its own sorted-set scheduler, so it
+        declares no ``.DQ`` queues — which stops the Worker from spawning idle
+        delay-queue consumers."""
         broker.declare_queue("q1")
-        assert "q1.DQ" in broker.get_declared_delay_queues()
+        assert broker.get_declared_delay_queues() == set()
 
 
 # ---------------------------------------------------------------------------

@@ -1,5 +1,4 @@
 import dramatiq
-import pytest
 
 from dramatiq_redis_streams.delayed import DelayedScheduler
 from dramatiq_redis_streams.keys import delayed_key, stream_key

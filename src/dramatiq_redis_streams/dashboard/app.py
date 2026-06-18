@@ -7,6 +7,10 @@ from urllib.parse import parse_qs
 from . import api
 from .page import HTML_PAGE
 
+# Default and hard ceiling for the per-worker pending-message detail list.
+_DEFAULT_PENDING_DETAIL = 20
+_MAX_PENDING_DETAIL = 200
+
 _STATUS_PHRASES = {
     200: "OK",
     404: "Not Found",
@@ -142,7 +146,19 @@ class DashboardApp:
         return self._json_response(start_response, 200, {"ok": True})
 
     def _workers(self, environ, start_response):
-        data = api.get_workers(self._client, self._namespace, self._declared)
+        qs = parse_qs(environ.get("QUERY_STRING", ""))
+        try:
+            pending_limit = int(qs.get("pending", [_DEFAULT_PENDING_DETAIL])[0])
+        except (TypeError, ValueError):
+            pending_limit = _DEFAULT_PENDING_DETAIL
+        # Hard-clamp: the per-message detail fetch costs one Redis round-trip
+        # per entry, so an unbounded value would re-introduce the very slowdown
+        # this endpoint was fixed to avoid.
+        pending_limit = max(0, min(pending_limit, _MAX_PENDING_DETAIL))
+        data = api.get_workers(
+            self._client, self._namespace, self._declared,
+            pending_limit=pending_limit,
+        )
         return self._json_response(start_response, 200, data)
 
 

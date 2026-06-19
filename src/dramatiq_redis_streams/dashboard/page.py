@@ -59,6 +59,11 @@ HTML_PAGE = """\
   .worker-meta span { display: inline-flex; align-items: center; gap: 4px; }
   .pending-table { margin-top: 8px; }
   .pending-table table { margin-bottom: 0; }
+  .help { display: inline-block; width: 14px; height: 14px; line-height: 14px;
+          text-align: center; border-radius: 50%; background: #cdd6da; color: #485460;
+          font-size: 10px; font-weight: 700; cursor: help; margin-left: 4px;
+          font-style: normal; vertical-align: middle; }
+  .stat-card .label .help { background: #e6ebee; }
 </style>
 </head>
 <body>
@@ -68,7 +73,7 @@ HTML_PAGE = """\
     <nav>
       <a href="#/">Overview</a>
       <a href="#/workers">Workers</a>
-      <a href="#/delayed">Delayed</a>
+      <a href="#/delayed">Scheduled</a>
     </nav>
   </div>
 </header>
@@ -115,6 +120,11 @@ HTML_PAGE = """\
       .replace(/"/g, '&quot;')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;');
+  }
+
+  // A small hoverable "?" carrying an explanatory tooltip.
+  function help(tip) {
+    return ' <span class="help" title="' + escAttr(tip) + '">?</span>';
   }
 
   function fmtTime(ts) {
@@ -172,25 +182,33 @@ HTML_PAGE = """\
       if (q.lag !== null && q.lag !== undefined) totalBacklog = (totalBacklog || 0) + q.lag;
     });
     h += '<div class="stat-card"><div class="value">' + data.queues.length + '</div><div class="label">Queues</div></div>';
-    h += '<div class="stat-card" title="Messages enqueued but not yet delivered to a worker"><div class="value">' + fmtBacklog(totalBacklog) + '</div><div class="label">Backlog</div></div>';
-    h += '<div class="stat-card" title="Acked messages per second, averaged over the last minute"><div class="value">' + fmtRate(totalRate) + '</div><div class="label">Throughput (1m avg)</div></div>';
-    h += '<div class="stat-card"><div class="value">' + data.delayed_count + '</div><div class="label">Delayed</div></div>';
-    h += '<div class="stat-card"><div class="value">' + totalDlq + '</div><div class="label">Dead Letters</div></div>';
+    h += '<div class="stat-card"><div class="value">' + fmtBacklog(totalBacklog) + '</div><div class="label">Waiting' + help('Messages enqueued but not yet picked up by any worker.') + '</div></div>';
+    h += '<div class="stat-card"><div class="value">' + fmtRate(totalRate) + '</div><div class="label">Throughput' + help('Tasks completed per second, averaged over the last minute.') + '</div></div>';
+    h += '<div class="stat-card"><div class="value">' + data.delayed_count + '</div><div class="label">Scheduled' + help('Messages waiting for a future time — delays and retry backoffs.') + '</div></div>';
+    h += '<div class="stat-card"><div class="value">' + totalDlq + '</div><div class="label">Failed' + help('Messages that gave up after exhausting retries (in the dead-letter queue).') + '</div></div>';
     h += '</div>';
     if (!data.queues.length) {
       h += '<div class="empty">No queues found.</div>';
       return h;
     }
-    h += '<table><tr><th>Queue</th><th>Stream Length</th><th>Consumers</th><th title="Enqueued, not yet delivered to a worker">Backlog</th><th title="Delivered to a worker, not yet acked">Pending</th><th>Rate</th><th>DLQ</th><th>Actions</th></tr>';
+    h += '<table><tr>';
+    h += '<th>Queue</th>';
+    h += '<th>Total' + help('Messages in the queue right now (waiting + in progress).') + '</th>';
+    h += '<th>Waiting' + help('Enqueued but not yet picked up by a worker.') + '</th>';
+    h += '<th>In&nbsp;progress' + help('Picked up by a worker, not yet completed.') + '</th>';
+    h += '<th>Rate' + help('Tasks completed per second (1-minute average).') + '</th>';
+    h += '<th>Failed' + help('Messages in the dead-letter queue. Click the count to inspect.') + '</th>';
+    h += '<th>Workers' + help('Worker processes currently consuming this queue.') + '</th>';
+    h += '<th>Actions</th></tr>';
     data.queues.forEach(function(q) {
       h += '<tr>';
       h += '<td><a href="#/queue/' + encodeURIComponent(q.name) + '">' + esc(q.name) + '</a></td>';
       h += '<td>' + q.stream_length + '</td>';
-      h += '<td>' + q.consumers + '</td>';
       h += '<td>' + fmtBacklog(q.lag) + '</td>';
       h += '<td>' + q.pending + '</td>';
       h += '<td>' + fmtRate(q._rate) + '</td>';
       h += '<td>' + (q.dlq_length > 0 ? '<a href="#/queue/' + encodeURIComponent(q.name) + '/dlq"><span class="badge badge-red">' + q.dlq_length + '</span></a>' : '<span class="badge badge-gray">0</span>') + '</td>';
+      h += '<td>' + q.consumers + '</td>';
       // Empty queues can be removed entirely; non-empty ones can be flushed.
       if (q.stream_length === 0 && q.dlq_length === 0) {
         h += '<td><button class="btn btn-danger" data-action="remove" data-queue="' + escAttr(q.name) + '">Remove</button></td>';
@@ -206,12 +224,15 @@ HTML_PAGE = """\
   function renderMessages(queue, msgs, isDlq) {
     var h = '<div class="breadcrumb"><a href="#/">Queues</a> &rsaquo; ';
     if (isDlq) {
-      h += '<a href="#/queue/' + encodeURIComponent(queue) + '">' + esc(queue) + '</a> &rsaquo; DLQ';
+      h += '<a href="#/queue/' + encodeURIComponent(queue) + '">' + esc(queue) + '</a> &rsaquo; Failed';
     } else {
       h += esc(queue);
     }
     h += '</div>';
-    h += '<h2>' + esc(queue) + (isDlq ? ' — Dead Letter Queue' : ' — Messages') + '</h2>';
+    h += '<h2>' + esc(queue) + (isDlq ? ' — Failed messages' : ' — Messages') + '</h2>';
+    if (isDlq) {
+      h += '<p style="font-size:13px;color:#636e72;margin:-4px 0 12px">Tasks that exhausted their retries. Requeue to try again, or delete to discard.</p>';
+    }
     if (isDlq) {
       h += '<div style="margin-bottom:12px">';
       h += '<button class="btn btn-primary" data-action="requeueAll" data-queue="' + escAttr(queue) + '">Requeue All</button>';
@@ -222,7 +243,11 @@ HTML_PAGE = """\
       h += '<div class="empty">No messages.</div>';
       return h;
     }
-    h += '<table><tr><th>ID</th><th>Actor</th><th>Args</th><th>Kwargs</th><th>Timestamp</th>';
+    h += '<table><tr>';
+    h += '<th>ID' + help('Redis stream entry ID for this message.') + '</th>';
+    h += '<th>Task' + help('The dramatiq actor (task function) to run.') + '</th>';
+    h += '<th>Args</th><th>Kwargs</th>';
+    h += '<th>Enqueued' + help('When the message was created.') + '</th>';
     if (isDlq) h += '<th>Actions</th>';
     h += '</tr>';
     msgs.forEach(function(m) {
@@ -245,13 +270,15 @@ HTML_PAGE = """\
   }
 
   function renderDelayed(msgs) {
-    var h = '<div class="breadcrumb"><a href="#/">Overview</a> &rsaquo; Delayed Messages</div>';
-    h += '<h2>Delayed Messages</h2>';
+    var h = '<div class="breadcrumb"><a href="#/">Overview</a> &rsaquo; Scheduled</div>';
+    h += '<h2>Scheduled messages</h2>';
+    h += '<p style="font-size:13px;color:#636e72;margin:-4px 0 12px">Messages waiting for a future time — explicit delays and retry backoffs.</p>';
     if (!msgs.length) {
-      h += '<div class="empty">No delayed messages.</div>';
+      h += '<div class="empty">No scheduled messages.</div>';
       return h;
     }
-    h += '<table><tr><th>Actor</th><th>Queue</th><th>Args</th><th>ETA</th></tr>';
+    h += '<table><tr><th>Task</th><th>Queue</th><th>Args</th>';
+    h += '<th>Runs at' + help('When this message becomes available to run.') + '</th></tr>';
     msgs.forEach(function(m) {
       h += '<tr>';
       h += '<td>' + esc(m.actor) + '</td>';
@@ -276,29 +303,34 @@ HTML_PAGE = """\
 
   function statusBadge(status) {
     var cls = status === 'active' ? 'badge-green' : status === 'idle' ? 'badge-orange' : 'badge-gray';
-    return '<span class="badge ' + cls + '">' + status + '</span>';
+    var tip = status === 'active' ? 'Checked in within the last minute.'
+            : status === 'idle' ? 'Quiet for 1–5 minutes.'
+            : 'No check-in for over 5 minutes — may have stopped.';
+    return '<span class="badge ' + cls + '" title="' + escAttr(tip) + '">' + status + '</span>';
   }
 
   function renderWorkerCard(w) {
     var h = '<div class="worker-card">';
     h += '<h3><span class="mono">' + esc(w.name) + '</span> ' + statusBadge(w.status) + '</h3>';
     h += '<div class="worker-meta">';
-    h += '<span title="Time since this worker last contacted Redis (a liveness heartbeat). Stays low while the worker is alive, even when it is busy or has a large backlog.">Last seen: <strong>' + fmtIdle(w.idle_ms) + ' ago</strong></span>';
-    h += '<span title="Messages this worker has claimed (delivered to it) but not yet acknowledged.">Reserved: <strong>' + w.total_pending + '</strong></span>';
+    h += '<span>Last seen: <strong>' + fmtIdle(w.idle_ms) + ' ago</strong>' + help('Time since this worker last contacted Redis (a liveness heartbeat). Stays low while the worker is alive, even when it is busy or has a large backlog.') + '</span>';
+    h += '<span>In progress: <strong>' + w.total_pending + '</strong>' + help('Tasks this worker has picked up but not yet completed.') + '</span>';
     h += '<span>Queues: ' + w.queues.map(function(q) {
       var det = w.queue_details[q];
       var pending = det ? det.pending : 0;
       var label = esc(q);
-      if (pending > 0) label += '&nbsp;<span class="badge badge-blue" title="Reserved by this worker on ' + esc(q) + '">' + pending + '</span>';
+      if (pending > 0) label += '&nbsp;<span class="badge badge-blue" title="' + escAttr(pending + ' task(s) in progress on ' + q) + '">' + pending + '</span>';
       return '<a href="#/queue/' + encodeURIComponent(q) + '">' + label + '</a>';
     }).join(', ') + '</span>';
     h += '</div>';
     if (w.pending_messages.length) {
       h += '<div class="pending-table">';
-      h += '<div style="font-size:12px;color:#636e72;margin:8px 0 4px">Messages reserved by this worker (claimed, not yet acked):</div>';
-      h += '<table><tr><th>Stream ID</th><th>Queue</th><th>Actor</th>';
-      h += '<th title="Time since this message was last delivered to the worker — i.e. how long it has been held without an ack.">Held for</th>';
-      h += '<th title="Times this message has been delivered to a worker. &gt;1 means it was redelivered: the previous owner died before acking, or the task ran longer than the 60s reclaim window and was stolen.">Deliveries</th></tr>';
+      h += '<div style="font-size:12px;color:#636e72;margin:8px 0 4px">Tasks in progress on this worker:</div>';
+      h += '<table><tr>';
+      h += '<th>ID' + help('Redis stream entry ID for this message.') + '</th>';
+      h += '<th>Queue</th><th>Task</th>';
+      h += '<th>Running for' + help('Time since this task was delivered to the worker — roughly how long it has been running.') + '</th>';
+      h += '<th>Attempts' + help('How many times this task has been delivered to a worker. More than 1 means it was retried after a worker failed to finish it in time — look for slow tasks or crashes.') + '</th></tr>';
       w.pending_messages.forEach(function(pm) {
         h += '<tr>';
         h += '<td class="mono">' + esc(pm.id) + '</td>';
@@ -311,7 +343,7 @@ HTML_PAGE = """\
       h += '</table>';
       if (w.total_pending > w.pending_messages.length) {
         h += '<div style="font-size:12px;color:#636e72;margin-top:6px">Showing ' +
-             w.pending_messages.length + ' of ' + w.total_pending + ' reserved messages.</div>';
+             w.pending_messages.length + ' of ' + w.total_pending + ' in-progress tasks.</div>';
       }
       h += '</div>';
     }
@@ -323,7 +355,7 @@ HTML_PAGE = """\
     var h = '<div class="breadcrumb"><a href="#/">Overview</a> &rsaquo; Workers</div>';
     h += '<h2>Workers</h2>';
     if (!workers.length) {
-      h += '<div class="empty">No active workers found.</div>';
+      h += '<div class="empty">No workers found.</div>';
       return h;
     }
 
@@ -333,7 +365,8 @@ HTML_PAGE = """\
     var others = workers.filter(function(w) { return w.status !== 'active'; })
                         .sort(function(a, b) { return a.idle_ms - b.idle_ms; });
 
-    h += '<h3 style="margin:8px 0 12px">Active <span class="badge badge-green">' + active.length + '</span></h3>';
+    h += '<h3 style="margin:8px 0 12px">Active <span class="badge badge-green">' + active.length + '</span>' +
+         help('Workers that checked in within the last minute.') + '</h3>';
     if (active.length) {
       active.forEach(function(w) { h += renderWorkerCard(w); });
     } else {
@@ -341,7 +374,8 @@ HTML_PAGE = """\
     }
 
     if (others.length) {
-      h += '<h3 style="margin:20px 0 12px">Idle / Stale <span class="badge badge-gray">' + others.length + '</span></h3>';
+      h += '<h3 style="margin:20px 0 12px">Inactive <span class="badge badge-gray">' + others.length + '</span>' +
+           help('Workers quiet for over a minute — idle, or possibly stopped.') + '</h3>';
       others.forEach(function(w) { h += renderWorkerCard(w); });
     }
     return h;

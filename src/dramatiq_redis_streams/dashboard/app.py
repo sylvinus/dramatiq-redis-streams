@@ -1,15 +1,22 @@
 """Minimal WSGI application for the Dramatiq Streams dashboard."""
 
 import json
+import logging
 import re
 from urllib.parse import parse_qs
 
 from . import api
 from .page import HTML_PAGE
 
+logger = logging.getLogger(__name__)
+
 # Default and hard ceiling for the per-worker pending-message detail list.
 _DEFAULT_PENDING_DETAIL = 20
 _MAX_PENDING_DETAIL = 200
+
+# Default and hard ceiling for message-listing endpoints.
+_DEFAULT_MESSAGE_COUNT = 50
+_MAX_MESSAGE_COUNT = 500
 
 _STATUS_PHRASES = {
     200: "OK",
@@ -54,10 +61,12 @@ class DashboardApp:
             if m:
                 try:
                     return handler(self, environ, start_response, **m.groupdict())
-                except Exception as exc:
+                except Exception:
+                    # Log details server-side; don't leak internals to clients.
+                    logger.exception("Dashboard request failed: %s %s", method, path)
                     return self._json_response(
                         start_response, 500,
-                        {"error": str(exc)},
+                        {"error": "Internal server error"},
                     )
 
         # Check if path matches but method is wrong → 405
@@ -102,6 +111,20 @@ class DashboardApp:
     def _declared(self):
         return self.broker.get_declared_queues()
 
+    @staticmethod
+    def _int_param(environ, key, default, maximum):
+        """Parse an integer query param, clamped to [0, maximum].
+
+        Bad input falls back to the default rather than 500-ing, and the hard
+        ceiling stops a crafted value from triggering an unbounded Redis read.
+        """
+        qs = parse_qs(environ.get("QUERY_STRING", ""))
+        try:
+            value = int(qs.get(key, [default])[0])
+        except (TypeError, ValueError):
+            value = default
+        return max(0, min(value, maximum))
+
     # ------------------------------------------------------------------
     # Route handlers
     # ------------------------------------------------------------------
@@ -114,14 +137,12 @@ class DashboardApp:
         return self._json_response(start_response, 200, data)
 
     def _queue_messages(self, environ, start_response, name=""):
-        qs = parse_qs(environ.get("QUERY_STRING", ""))
-        count = int(qs.get("count", [50])[0])
+        count = self._int_param(environ, "count", _DEFAULT_MESSAGE_COUNT, _MAX_MESSAGE_COUNT)
         data = api.get_queue_messages(self._client, self._namespace, name, count=count)
         return self._json_response(start_response, 200, data)
 
     def _dlq_messages(self, environ, start_response, name=""):
-        qs = parse_qs(environ.get("QUERY_STRING", ""))
-        count = int(qs.get("count", [50])[0])
+        count = self._int_param(environ, "count", _DEFAULT_MESSAGE_COUNT, _MAX_MESSAGE_COUNT)
         data = api.get_dlq_messages(self._client, self._namespace, name, count=count)
         return self._json_response(start_response, 200, data)
 
@@ -154,15 +175,12 @@ class DashboardApp:
         return self._json_response(start_response, 200, {"ok": ok})
 
     def _workers(self, environ, start_response):
-        qs = parse_qs(environ.get("QUERY_STRING", ""))
-        try:
-            pending_limit = int(qs.get("pending", [_DEFAULT_PENDING_DETAIL])[0])
-        except (TypeError, ValueError):
-            pending_limit = _DEFAULT_PENDING_DETAIL
         # Hard-clamp: the per-message detail fetch costs one Redis round-trip
         # per entry, so an unbounded value would re-introduce the very slowdown
         # this endpoint was fixed to avoid.
-        pending_limit = max(0, min(pending_limit, _MAX_PENDING_DETAIL))
+        pending_limit = self._int_param(
+            environ, "pending", _DEFAULT_PENDING_DETAIL, _MAX_PENDING_DETAIL,
+        )
         data = api.get_workers(
             self._client, self._namespace, self._declared,
             pending_limit=pending_limit,

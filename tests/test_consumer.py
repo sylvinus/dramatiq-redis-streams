@@ -179,9 +179,9 @@ class TestConsumerRequeue:
 # XAUTOCLAIM
 # ---------------------------------------------------------------------------
 
-class TestConsumerAutoclaim:
+class TestConsumerReclaim:
     @pytest.mark.timeout(10)
-    def test_recovers_orphaned_messages(self, broker, redis_client):
+    def test_recovers_orphaned_messages_past_deadline(self, broker, redis_client):
         broker.enqueue(make_message(args=(99,)))
 
         # Consumer A reads but never acks — simulates a crash.
@@ -193,17 +193,106 @@ class TestConsumerAutoclaim:
         # Let the message become idle.
         time.sleep(1.5)
 
-        # Consumer B with aggressive autoclaim settings.
+        # Consumer B whose deadline has already elapsed (no declared time_limit
+        # → default_time_limit; set to 0 so the 1.5s-idle message is past it).
         broker_b = StreamsBroker(client=redis_client, middleware=[])
         broker_b.broker_id = "consumer-b"
         consumer_b = broker_b.consume("test-queue", timeout=500)
-        consumer_b.min_idle_time = 1000   # 1 s
-        consumer_b.autoclaim_interval = 0  # run autoclaim every call
+        consumer_b.reclaim_interval = 0      # sweep on every call
+        consumer_b.default_time_limit = 0
+        consumer_b.reclaim_grace = 0
 
         proxy2 = next(consumer_b)
         assert proxy2 is not None
         assert proxy2.args == (99,)
         consumer_b.close()
+
+    @pytest.mark.timeout(10)
+    def test_does_not_reclaim_within_task_deadline(self, broker, redis_client):
+        """A worker still within a task's time_limit is never robbed of it."""
+        broker.enqueue(make_message(args=(7,)))
+        consumer_a = broker.consume("test-queue", timeout=1000)
+        proxy = next(consumer_a)
+        assert proxy is not None
+        consumer_a._closed = True
+
+        time.sleep(1.5)  # idle ~1.5s, but the deadline is far larger
+
+        broker_b = StreamsBroker(client=redis_client, middleware=[])
+        broker_b.broker_id = "consumer-b"
+        consumer_b = broker_b.consume("test-queue", timeout=300)
+        consumer_b.reclaim_interval = 0
+        consumer_b.default_time_limit = 3_600_000  # 1h deadline
+        consumer_b.reclaim_grace = 0
+        consumer_b.reclaim_min_idle = 0
+
+        # Nothing reclaimed: the message is well within its deadline.
+        assert next(consumer_b) is None
+        sk = stream_key("test-queue", broker.namespace)
+        owners = {
+            (c["name"].decode() if isinstance(c["name"], bytes) else c["name"]): c["pending"]
+            for c in redis_client.xinfo_consumers(sk, GROUP_NAME)
+        }
+        assert owners.get(consumer_a._consumer_name) == 1   # still held by A
+        consumer_b.close()
+
+    @pytest.mark.timeout(10)
+    def test_reclaim_is_bounded_by_prefetch(self, broker, redis_client):
+        """A sweep claims at most `prefetch` orphans, not the whole backlog."""
+        for i in range(5):
+            broker.enqueue(make_message(args=(i,)))
+        dead = broker.consume("test-queue", prefetch=5, timeout=500)
+        held = [next(dead) for _ in range(5)]   # dead worker holds all 5
+        assert all(m is not None for m in held)
+        dead._closed = True
+
+        broker_b = StreamsBroker(client=redis_client, middleware=[])
+        broker_b.broker_id = "consumer-b"
+        live = broker_b.consume("test-queue", prefetch=2, timeout=300)
+        live.reclaim_interval = 0
+        live.default_time_limit = 0   # everything past deadline
+        live.reclaim_grace = 0
+        live.reclaim_min_idle = 0
+
+        live._reclaim_orphans()
+        assert len(live._buffer) == 2   # capped at prefetch, not 5
+        live.close()
+
+    @pytest.mark.timeout(10)
+    def test_does_not_reclaim_own_overdue_message(self, broker, redis_client):
+        """A worker must never re-claim its OWN in-flight message, even when it
+        has overrun its deadline — that would double-run the task."""
+        broker.enqueue(make_message(args=(5,)))
+        consumer = broker.consume("test-queue", timeout=300)
+        consumer.reclaim_interval = 0
+        consumer.default_time_limit = 0   # deadline already elapsed
+        consumer.reclaim_grace = 0
+        consumer.reclaim_min_idle = 0
+
+        proxy = next(consumer)            # now owned (pending) by this consumer
+        assert proxy is not None
+        time.sleep(0.1)
+
+        # A sweep must not hand the message back to this same worker.
+        consumer._reclaim_orphans()
+        assert consumer._buffer == []
+
+        consumer.ack(proxy)
+        consumer.close()
+
+    def test_deadline_uses_message_time_limit(self, broker):
+        consumer = broker.consume("test-queue", timeout=100)
+        msg = make_message()
+        msg.options["time_limit"] = 120000
+        assert consumer._task_deadline_ms(msg) == 120000 + consumer.reclaim_grace
+        consumer.close()
+
+    def test_deadline_falls_back_to_default(self, broker):
+        consumer = broker.consume("test-queue", timeout=100)
+        consumer.default_time_limit = 45000
+        msg = make_message()  # no time_limit declared
+        assert consumer._task_deadline_ms(msg) == 45000 + consumer.reclaim_grace
+        consumer.close()
 
 
 class TestConsumerGroupRecovery:

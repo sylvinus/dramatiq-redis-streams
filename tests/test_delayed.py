@@ -23,7 +23,7 @@ class TestDelayedScheduler:
         assert redis_client.zcard(delayed_key()) == 1
         assert redis_client.xlen(stream_key("test-queue")) == 0
 
-        scheduler = DelayedScheduler(broker, interval=0.05)
+        scheduler = DelayedScheduler(broker, interval=50)
         scheduler.start()
         try:
             ok = wait_for(lambda: redis_client.xlen(stream_key("test-queue")) > 0)
@@ -37,7 +37,7 @@ class TestDelayedScheduler:
         broker.declare_queue("test-queue")
         broker.enqueue(make_message(), delay=5000)
 
-        scheduler = DelayedScheduler(broker, interval=0.05)
+        scheduler = DelayedScheduler(broker, interval=50)
         scheduler.start()
         try:
             ok = wait_for(lambda: redis_client.xlen(stream_key("test-queue")) > 0, timeout=0.3)
@@ -52,7 +52,7 @@ class TestDelayedScheduler:
         broker.enqueue(make_message(args=("later",)), delay=500)
         broker.enqueue(make_message(args=("sooner",)), delay=100)
 
-        scheduler = DelayedScheduler(broker, interval=0.05)
+        scheduler = DelayedScheduler(broker, interval=50)
         scheduler.start()
         try:
             # Wait for at least the first message.
@@ -78,7 +78,7 @@ class TestDelayedScheduler:
         broker.enqueue(make_message(queue="q-a", args=("a",)), delay=100)
         broker.enqueue(make_message(queue="q-b", args=("b",)), delay=100)
 
-        scheduler = DelayedScheduler(broker, interval=0.05)
+        scheduler = DelayedScheduler(broker, interval=50)
         scheduler.start()
         try:
             ok = wait_for(
@@ -97,7 +97,7 @@ class TestDelayedScheduler:
         for i in range(10):
             broker.enqueue(make_message(args=(i,)), delay=50)
 
-        scheduler = DelayedScheduler(broker, interval=0.05, batch_size=5)
+        scheduler = DelayedScheduler(broker, interval=50, batch_size=5)
         scheduler.start()
         try:
             ok = wait_for(lambda: redis_client.xlen(stream_key("test-queue")) == 10)
@@ -107,7 +107,7 @@ class TestDelayedScheduler:
             scheduler.join(timeout=3)
 
     def test_stop(self, broker):
-        scheduler = DelayedScheduler(broker, interval=0.1)
+        scheduler = DelayedScheduler(broker, interval=100)
         scheduler.start()
         assert scheduler.is_alive()
 
@@ -130,8 +130,8 @@ class TestConsumerReaper:
         name = consumer._consumer_name
         assert name in _consumer_names(redis_client, "work")
 
-        # reap_min_idle_ms=0 → any drained consumer is eligible immediately.
-        sched = DelayedScheduler(broker, reap_min_idle_ms=0)
+        # reap_min_idle=0 → any drained consumer is eligible immediately.
+        sched = DelayedScheduler(broker, reap_min_idle=0)
         reaped = sched._reap_consumers()
 
         assert reaped >= 1
@@ -145,7 +145,7 @@ class TestConsumerReaper:
         msg = next(consumer)  # delivered, NOT acked → pending 1
         name = consumer._consumer_name
 
-        sched = DelayedScheduler(broker, reap_min_idle_ms=0)
+        sched = DelayedScheduler(broker, reap_min_idle=0)
         reaped = sched._reap_consumers()
 
         assert reaped == 0
@@ -162,7 +162,7 @@ class TestConsumerReaper:
         name = consumer._consumer_name
 
         # High idle threshold → a just-active consumer is not eligible.
-        sched = DelayedScheduler(broker, reap_min_idle_ms=3_600_000)
+        sched = DelayedScheduler(broker, reap_min_idle=3_600_000)
         reaped = sched._reap_consumers()
 
         assert reaped == 0

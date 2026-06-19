@@ -5,6 +5,7 @@ import uuid
 
 import dramatiq
 import redis as redis_mod
+from dramatiq.middleware import TimeLimit
 
 from .consumer import StreamsConsumer
 from .delayed import DelayedScheduler
@@ -17,8 +18,8 @@ class StreamsBroker(dramatiq.Broker):
     """A Dramatiq broker that uses Redis Streams for message transport.
 
     Uses XREADGROUP with BLOCK for event-driven consumption (zero CPU when
-    idle), Redis Streams PEL for delivery tracking, XAUTOCLAIM for dead
-    consumer recovery, and a single sorted set for delayed messages.
+    idle), Redis Streams PEL for delivery tracking, per-task-deadline recovery
+    of messages from dead workers, and a single sorted set for delayed messages.
 
     Requires Redis >= 7.0.
 
@@ -27,12 +28,54 @@ class StreamsBroker(dramatiq.Broker):
         client: Pre-configured ``redis.Redis`` instance.
         middleware: List of Dramatiq middleware. ``None`` for defaults.
         namespace: Key prefix for all Redis keys (default ``"dramatiq"``).
+        default_time_limit: Effective timeout (ms) for tasks that declare no
+            ``time_limit``. A single value with two effects: dramatiq's
+            ``TimeLimit`` middleware raises ``TimeLimitExceeded`` in the worker
+            at this point (only applied when ``middleware`` is left as defaults),
+            and a message unacked past this deadline is treated as orphaned and
+            re-delivered. Set ``time_limit`` per actor/message to override both.
+            Default 60 000 — deliberately tight, so a forgotten timeout surfaces.
+        reclaim_grace: Extra ms beyond a task's deadline before its message is
+            eligible for reclaim (default 10 000).
+        reclaim_interval: Milliseconds between orphan-recovery sweeps
+            (default 30 000). All broker time values are in milliseconds, as in
+            dramatiq itself.
     """
 
-    def __init__(self, *, url="redis://localhost:6379/0", client=None, middleware=None, namespace="dramatiq"):
+    def __init__(
+        self,
+        *,
+        url="redis://localhost:6379/0",
+        client=None,
+        middleware=None,
+        namespace="dramatiq",
+        default_time_limit=60000,
+        reclaim_grace=10000,
+        reclaim_interval=30000,
+    ):
         super().__init__(middleware=middleware)
         self.namespace = namespace
         self.queues = set()  # base class uses dict; brokers use set
+        self.reclaim_grace = reclaim_grace
+        self.reclaim_interval = reclaim_interval
+
+        # Keep the reclaim deadline and dramatiq's in-worker TimeLimit abort in
+        # lock-step, so a task without an explicit time_limit is aborted AND
+        # reclaimed at the same point — never one without the other.
+        timelimit_mw = next((m for m in self.middleware if isinstance(m, TimeLimit)), None)
+        if middleware is None:
+            # We own the default middleware stack → impose our (tight) default.
+            if timelimit_mw is not None:
+                timelimit_mw.time_limit = default_time_limit
+            self.default_time_limit = default_time_limit
+        elif timelimit_mw is not None:
+            # Caller controls middleware → reclaim follows THEIR TimeLimit so
+            # the two can't diverge.
+            self.default_time_limit = timelimit_mw.time_limit
+        else:
+            # Caller supplied middleware with no TimeLimit (no in-worker abort);
+            # reclaim still falls back to default_time_limit.
+            self.default_time_limit = default_time_limit
 
         if client is not None:
             self.client = client
@@ -138,6 +181,9 @@ class StreamsBroker(dramatiq.Broker):
             queue_name=queue_name,
             prefetch=prefetch,
             timeout=timeout,
+            reclaim_interval=self.reclaim_interval,
+            default_time_limit=self.default_time_limit,
+            reclaim_grace=self.reclaim_grace,
         )
 
     def flush(self, queue_name):
@@ -146,6 +192,12 @@ class StreamsBroker(dramatiq.Broker):
         self._ensure_group(key)
 
     def flush_all(self):
+        """Flush every declared queue's stream and the delayed set.
+
+        The delayed sorted set is global, so this clears delayed messages for
+        all queues regardless of which were declared in this process. Intended
+        for tests.
+        """
         for queue_name in list(self.queues):
             self.flush(queue_name)
         self.client.delete(delayed_key(self.namespace))

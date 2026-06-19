@@ -53,26 +53,40 @@ def _discover_queues(client, namespace, declared_queues):
 
 
 def get_overview(client, namespace, declared_queues=()):
-    """Return an overview of all queues and delayed message count."""
+    """Return an overview of all queues and delayed message count.
+
+    All per-queue reads (``XLEN`` main, ``XINFO GROUPS``, ``XLEN`` dlq) plus the
+    delayed ``ZCARD`` are issued in a single pipeline — one round-trip instead
+    of ~3 per queue. Per-command errors (e.g. a missing group) surface as
+    exceptions in the result list and degrade to zero, not a failed request.
+    """
     queue_names = _discover_queues(client, namespace, declared_queues)
-    queues = []
+
+    pipe = client.pipeline(transaction=False)
     for name in queue_names:
-        sk = stream_key(name, namespace)
-        dk = dlq_stream_key(name, namespace)
+        pipe.xlen(stream_key(name, namespace))
+        pipe.xinfo_groups(stream_key(name, namespace))
+        pipe.xlen(dlq_stream_key(name, namespace))
+    pipe.zcard(delayed_key(namespace))
+    try:
+        results = pipe.execute(raise_on_error=False)
+    except Exception:
+        results = []
 
-        try:
-            length = client.xlen(sk)
-        except Exception:
-            length = 0
+    def at(i):
+        return results[i] if 0 <= i < len(results) else None
 
-        consumers = 0
-        pending = 0
-        entries_read = 0
+    def num(v):
+        return v if isinstance(v, int) else 0
+
+    queues = []
+    for i, name in enumerate(queue_names):
+        groups = at(i * 3 + 1)
+        consumers = pending = entries_read = 0
         # ``lag`` (undelivered backlog) stays None unless Redis reports a usable
         # value — it goes unavailable right after deletions such as a flush.
         lag = None
-        try:
-            groups = client.xinfo_groups(sk)
+        if isinstance(groups, list):
             for g in groups:
                 consumers += g.get("consumers", 0)
                 pending += g.get("pending", 0)
@@ -82,32 +96,21 @@ def get_overview(client, namespace, declared_queues=()):
                 lg = g.get("lag")
                 if lg is not None:
                     lag = (lag or 0) + lg
-        except Exception:
-            pass
 
-        try:
-            dlq_length = client.xlen(dk)
-        except Exception:
-            dlq_length = 0
-
-        # ``processed`` is the cumulative number of acked messages
-        # (delivered minus still-pending). Sampling it over time on the client
-        # yields the queue's processing rate without any server-side state.
+        # ``processed`` is the cumulative number of acked messages (delivered
+        # minus still-pending). Sampling it over time on the client yields the
+        # queue's processing rate without any server-side state.
         queues.append({
             "name": name,
-            "stream_length": length,
+            "stream_length": num(at(i * 3)),
             "consumers": consumers,
             "pending": pending,
-            "dlq_length": dlq_length,
+            "dlq_length": num(at(i * 3 + 2)),
             "lag": lag,
             "processed": max(0, entries_read - pending),
         })
 
-    try:
-        delayed_count = client.zcard(delayed_key(namespace))
-    except Exception:
-        delayed_count = 0
-
+    delayed_count = num(at(len(queue_names) * 3))
     return {"queues": queues, "delayed_count": delayed_count}
 
 

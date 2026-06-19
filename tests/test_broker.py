@@ -1,6 +1,7 @@
 import dramatiq
 import pytest
 
+from dramatiq_redis_streams import StreamsBroker
 from dramatiq_redis_streams.keys import GROUP_NAME, delayed_key, queues_key, stream_key
 
 from .conftest import make_message
@@ -45,6 +46,40 @@ class TestDeclareQueue:
         for name in ["alpha", "beta", "gamma"]:
             broker.declare_queue(name)
         assert {"alpha", "beta", "gamma"} <= broker.queues
+
+
+class TestTaskTimeout:
+    def test_default_time_limit_aligns_timelimit_middleware(self, redis_client):
+        """default_time_limit drives dramatiq's in-worker TimeLimit abort too."""
+        from dramatiq.middleware import TimeLimit
+
+        b = StreamsBroker(client=redis_client, default_time_limit=12345)
+        try:
+            tl = next(m for m in b.middleware if isinstance(m, TimeLimit))
+            assert tl.time_limit == 12345
+        finally:
+            b.close()
+
+    def test_custom_middleware_is_left_untouched(self, redis_client):
+        """A caller's TimeLimit is not mutated, and the reclaim deadline follows
+        it (so the in-worker abort and reclaim can't diverge)."""
+        from dramatiq.middleware import TimeLimit
+
+        tl = TimeLimit(time_limit=999)
+        b = StreamsBroker(client=redis_client, middleware=[tl], default_time_limit=12345)
+        try:
+            assert tl.time_limit == 999            # not mutated
+            assert b.default_time_limit == 999     # reclaim follows it
+        finally:
+            b.close()
+
+    def test_custom_middleware_without_timelimit(self, redis_client):
+        """With no TimeLimit in custom middleware, reclaim uses the param."""
+        b = StreamsBroker(client=redis_client, middleware=[], default_time_limit=12345)
+        try:
+            assert b.default_time_limit == 12345
+        finally:
+            b.close()
 
 
 class TestQueueRegistry:

@@ -107,6 +107,16 @@ HTML_PAGE = """\
     return d.innerHTML;
   }
 
+  // Escape for use inside a double-quoted HTML attribute. esc() leaves quotes
+  // intact, so it is NOT safe for attribute values — use this for data-* attrs.
+  function escAttr(s) {
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/"/g, '&quot;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+
   function fmtTime(ts) {
     if (!ts) return '-';
     return new Date(ts).toLocaleString();
@@ -183,9 +193,9 @@ HTML_PAGE = """\
       h += '<td>' + (q.dlq_length > 0 ? '<a href="#/queue/' + encodeURIComponent(q.name) + '/dlq"><span class="badge badge-red">' + q.dlq_length + '</span></a>' : '<span class="badge badge-gray">0</span>') + '</td>';
       // Empty queues can be removed entirely; non-empty ones can be flushed.
       if (q.stream_length === 0 && q.dlq_length === 0) {
-        h += '<td><button class="btn btn-danger" onclick="removeQueue(\\'' + esc(q.name) + '\\')">Remove</button></td>';
+        h += '<td><button class="btn btn-danger" data-action="remove" data-queue="' + escAttr(q.name) + '">Remove</button></td>';
       } else {
-        h += '<td><button class="btn btn-danger" onclick="flushQueue(\\'' + esc(q.name) + '\\')">Flush</button></td>';
+        h += '<td><button class="btn btn-danger" data-action="flush" data-queue="' + escAttr(q.name) + '">Flush</button></td>';
       }
       h += '</tr>';
     });
@@ -204,8 +214,8 @@ HTML_PAGE = """\
     h += '<h2>' + esc(queue) + (isDlq ? ' — Dead Letter Queue' : ' — Messages') + '</h2>';
     if (isDlq) {
       h += '<div style="margin-bottom:12px">';
-      h += '<button class="btn btn-primary" onclick="requeueAllDlq(\\'' + esc(queue) + '\\')">Requeue All</button>';
-      h += '<button class="btn btn-danger" onclick="purgeDlq(\\'' + esc(queue) + '\\')">Purge All</button>';
+      h += '<button class="btn btn-primary" data-action="requeueAll" data-queue="' + escAttr(queue) + '">Requeue All</button>';
+      h += '<button class="btn btn-danger" data-action="purge" data-queue="' + escAttr(queue) + '">Purge All</button>';
       h += '</div>';
     }
     if (!msgs.length) {
@@ -224,8 +234,8 @@ HTML_PAGE = """\
       h += '<td>' + fmtTime(m.timestamp) + '</td>';
       if (isDlq) {
         h += '<td>';
-        h += '<button class="btn btn-primary" onclick="requeueMsg(\\'' + esc(queue) + '\\',\\'' + esc(m.id) + '\\')">Requeue</button>';
-        h += '<button class="btn btn-danger" onclick="deleteMsg(\\'' + esc(queue) + '\\',\\'' + esc(m.id) + '\\')">Delete</button>';
+        h += '<button class="btn btn-primary" data-action="requeue" data-queue="' + escAttr(queue) + '" data-id="' + escAttr(m.id) + '">Requeue</button>';
+        h += '<button class="btn btn-danger" data-action="delete" data-queue="' + escAttr(queue) + '" data-id="' + escAttr(m.id) + '">Delete</button>';
         h += '</td>';
       }
       h += '</tr>';
@@ -273,32 +283,35 @@ HTML_PAGE = """\
     var h = '<div class="worker-card">';
     h += '<h3><span class="mono">' + esc(w.name) + '</span> ' + statusBadge(w.status) + '</h3>';
     h += '<div class="worker-meta">';
-    h += '<span>Idle: <strong>' + fmtIdle(w.idle_ms) + '</strong></span>';
-    h += '<span>Pending: <strong>' + w.total_pending + '</strong></span>';
+    h += '<span title="Time since this worker last contacted Redis (a liveness heartbeat). Stays low while the worker is alive, even when it is busy or has a large backlog.">Last seen: <strong>' + fmtIdle(w.idle_ms) + ' ago</strong></span>';
+    h += '<span title="Messages this worker has claimed (delivered to it) but not yet acknowledged.">Reserved: <strong>' + w.total_pending + '</strong></span>';
     h += '<span>Queues: ' + w.queues.map(function(q) {
       var det = w.queue_details[q];
       var pending = det ? det.pending : 0;
       var label = esc(q);
-      if (pending > 0) label += '&nbsp;<span class="badge badge-blue">' + pending + '</span>';
+      if (pending > 0) label += '&nbsp;<span class="badge badge-blue" title="Reserved by this worker on ' + esc(q) + '">' + pending + '</span>';
       return '<a href="#/queue/' + encodeURIComponent(q) + '">' + label + '</a>';
     }).join(', ') + '</span>';
     h += '</div>';
     if (w.pending_messages.length) {
       h += '<div class="pending-table">';
-      h += '<table><tr><th>Stream ID</th><th>Queue</th><th>Actor</th><th>Idle</th><th>Deliveries</th></tr>';
+      h += '<div style="font-size:12px;color:#636e72;margin:8px 0 4px">Messages reserved by this worker (claimed, not yet acked):</div>';
+      h += '<table><tr><th>Stream ID</th><th>Queue</th><th>Actor</th>';
+      h += '<th title="Time since this message was last delivered to the worker — i.e. how long it has been held without an ack.">Held for</th>';
+      h += '<th title="Times this message has been delivered to a worker. &gt;1 means it was redelivered: the previous owner died before acking, or the task ran longer than the 60s reclaim window and was stolen.">Deliveries</th></tr>';
       w.pending_messages.forEach(function(pm) {
         h += '<tr>';
         h += '<td class="mono">' + esc(pm.id) + '</td>';
         h += '<td>' + esc(pm.queue) + '</td>';
         h += '<td>' + esc(pm.actor) + '</td>';
         h += '<td>' + fmtIdle(pm.idle_ms) + '</td>';
-        h += '<td>' + pm.deliveries + '</td>';
+        h += '<td>' + (pm.deliveries > 1 ? '<strong style="color:#e17055">' + pm.deliveries + '</strong>' : pm.deliveries) + '</td>';
         h += '</tr>';
       });
       h += '</table>';
       if (w.total_pending > w.pending_messages.length) {
         h += '<div style="font-size:12px;color:#636e72;margin-top:6px">Showing ' +
-             w.pending_messages.length + ' of ' + w.total_pending + ' pending messages.</div>';
+             w.pending_messages.length + ' of ' + w.total_pending + ' reserved messages.</div>';
       }
       h += '</div>';
     }
@@ -385,6 +398,22 @@ HTML_PAGE = """\
   window.deleteMsg = function(queue, id) {
     api('/api/queues/' + encodeURIComponent(queue) + '/dlq/' + encodeURIComponent(id) + '/delete', {method:'POST'}).then(route);
   };
+
+  // Delegated handler: action buttons carry data-* attributes instead of inline
+  // onclick, so queue names/ids never enter a JS-string context (no injection).
+  app.addEventListener('click', function(e) {
+    var btn = e.target.closest && e.target.closest('button[data-action]');
+    if (!btn) return;
+    var q = btn.dataset.queue, id = btn.dataset.id;
+    switch (btn.dataset.action) {
+      case 'flush': flushQueue(q); break;
+      case 'remove': removeQueue(q); break;
+      case 'purge': purgeDlq(q); break;
+      case 'requeueAll': requeueAllDlq(q); break;
+      case 'requeue': requeueMsg(q, id); break;
+      case 'delete': deleteMsg(q, id); break;
+    }
+  });
 
   function scheduleRefresh() {
     clearTimeout(timer);

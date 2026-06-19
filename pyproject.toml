@@ -25,7 +25,9 @@ classifiers = [
     "Topic :: System :: Distributed Computing",
 ]
 dependencies = [
-    "dramatiq>=2.0",
+    # Verified against the 2.x line (2.0.0–2.2.0). v3.0.0 is signposted as a
+    # breaking release, so cap until it's validated.
+    "dramatiq>=2.0,<3",
     "redis>=5.0",
 ]
 

@@ -141,9 +141,17 @@ class DashboardApp:
         count = api.purge_dlq(self._client, self._namespace, name)
         return self._json_response(start_response, 200, {"purged": count})
 
+    def _requeue_all(self, environ, start_response, name=""):
+        count = api.requeue_all_dlq(self._client, self._namespace, name)
+        return self._json_response(start_response, 200, {"requeued": count})
+
     def _flush(self, environ, start_response, name=""):
         api.flush_queue(self._client, self._namespace, name)
         return self._json_response(start_response, 200, {"ok": True})
+
+    def _remove(self, environ, start_response, name=""):
+        ok = api.remove_queue(self._client, self._namespace, name)
+        return self._json_response(start_response, 200, {"ok": ok})
 
     def _workers(self, environ, start_response):
         qs = parse_qs(environ.get("QUERY_STRING", ""))
@@ -175,6 +183,8 @@ _ROUTES = [
     _r("POST", r"/api/queues/(?P<name>[^/]+)/dlq/(?P<stream_id>[^/]+)/requeue", DashboardApp._requeue),
     _r("POST", r"/api/queues/(?P<name>[^/]+)/dlq/(?P<stream_id>[^/]+)/delete", DashboardApp._delete),
     _r("POST", r"/api/queues/(?P<name>[^/]+)/dlq/purge", DashboardApp._purge),
+    _r("POST", r"/api/queues/(?P<name>[^/]+)/dlq/requeue-all", DashboardApp._requeue_all),
     _r("POST", r"/api/queues/(?P<name>[^/]+)/flush", DashboardApp._flush),
+    _r("POST", r"/api/queues/(?P<name>[^/]+)/remove", DashboardApp._remove),
     _r("GET", "/api/workers", DashboardApp._workers),
 ]

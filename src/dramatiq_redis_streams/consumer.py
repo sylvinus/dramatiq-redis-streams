@@ -81,6 +81,18 @@ class StreamsConsumer(dramatiq.Consumer):
                 count=self.prefetch,
                 block=self.timeout,
             )
+        except redis_mod.ResponseError as exc:
+            if "NOGROUP" in str(exc):
+                # The group was removed out-of-band (e.g. the queue was removed
+                # from the dashboard). Recreate it and re-register so an in-use
+                # queue heals instead of spinning on errors.
+                logger.info("Consumer group missing for %s, recreating", self._stream_key)
+                self.broker._ensure_group(self._stream_key)
+                self.broker._register_queue(self.queue_name, force=True)
+                return None
+            logger.warning("Redis error during XREADGROUP, will retry", exc_info=True)
+            time.sleep(1)
+            return None
         except redis_mod.RedisError:
             logger.warning("Redis error during XREADGROUP, will retry", exc_info=True)
             time.sleep(1)

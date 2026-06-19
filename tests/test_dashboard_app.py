@@ -6,7 +6,7 @@ from io import BytesIO
 import dramatiq
 
 from dramatiq_redis_streams.dashboard.app import _MAX_PENDING_DETAIL, DashboardApp
-from dramatiq_redis_streams.keys import dlq_stream_key
+from dramatiq_redis_streams.keys import dlq_stream_key, queues_key, stream_key
 
 
 def make_message(queue="test-queue", actor="test-actor", args=(), kwargs=None):
@@ -76,6 +76,15 @@ class TestOverviewAPI:
         names = [q["name"] for q in data["queues"]]
         assert "tasks" in names
 
+    def test_discovers_queues_from_registry(self, broker, redis_client):
+        """A queue registered by a worker (in another process) is listed even
+        though this dashboard's broker never declared it."""
+        redis_client.sadd(queues_key(broker.namespace), "worker-only")
+        app = DashboardApp(broker)
+        status, _headers, body = _request(app, "GET", "/api/overview")
+        assert status == 200
+        assert "worker-only" in [q["name"] for q in json.loads(body)["queues"]]
+
 
 class TestQueueMessagesAPI:
     def test_get_messages(self, broker):
@@ -135,6 +144,20 @@ class TestDlqAPI:
         data = json.loads(body)
         assert data["purged"] == 3
 
+    def test_requeue_all_dlq(self, broker, redis_client):
+        broker.declare_queue("work")
+        dk = dlq_stream_key("work", broker.namespace)
+        sk = stream_key("work", broker.namespace)
+        for _ in range(3):
+            redis_client.xadd(dk, {"data": make_message(queue="work").encode()})
+        app = DashboardApp(broker)
+        status, _headers, body = _request(app, "POST", "/api/queues/work/dlq/requeue-all")
+        assert status == 200
+        data = json.loads(body)
+        assert data["requeued"] == 3
+        assert redis_client.xlen(dk) == 0
+        assert redis_client.xlen(sk) == 3
+
 
 class TestDelayedAPI:
     def test_get_delayed(self, broker):
@@ -157,6 +180,19 @@ class TestFlushAPI:
         assert status == 200
         data = json.loads(body)
         assert data["ok"] is True
+
+
+class TestRemoveAPI:
+    def test_remove_queue(self, broker, redis_client):
+        redis_client.sadd(queues_key(broker.namespace), "work")
+        redis_client.xadd(stream_key("work", broker.namespace), {"data": b"x"})
+        app = DashboardApp(broker)
+        status, _headers, body = _request(app, "POST", "/api/queues/work/remove")
+        assert status == 200
+        assert json.loads(body)["ok"] is True
+        assert not redis_client.exists(stream_key("work", broker.namespace))
+        members = redis_client.smembers(queues_key(broker.namespace))
+        assert b"work" not in members and "work" not in members
 
 
 class TestWorkersAPI:

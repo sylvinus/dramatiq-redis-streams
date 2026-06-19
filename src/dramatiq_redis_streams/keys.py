@@ -13,6 +13,15 @@ def delayed_key(namespace="dramatiq"):
     return f"{namespace}:delayed"
 
 
+def queues_key(namespace="dramatiq"):
+    """Return the Redis Set key listing all known queue names.
+
+    Populated lazily by the broker (on enqueue/consume) so the dashboard can
+    list every queue with a single ``SMEMBERS`` instead of a keyspace ``SCAN``.
+    """
+    return f"{namespace}:queues"
+
+
 def dlq_stream_key(queue_name, namespace="dramatiq"):
     """Return the Redis Stream key for a queue's dead-letter queue."""
     return f"{namespace}:dlq:{queue_name}"

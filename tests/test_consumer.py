@@ -4,7 +4,7 @@ import dramatiq
 import pytest
 
 from dramatiq_redis_streams import StreamsBroker
-from dramatiq_redis_streams.keys import dlq_stream_key, stream_key
+from dramatiq_redis_streams.keys import GROUP_NAME, dlq_stream_key, queues_key, stream_key
 
 from .conftest import make_message
 
@@ -204,3 +204,29 @@ class TestConsumerAutoclaim:
         assert proxy2 is not None
         assert proxy2.args == (99,)
         consumer_b.close()
+
+
+class TestConsumerGroupRecovery:
+    def test_recreates_missing_group(self, broker, redis_client):
+        """If the group is removed out-of-band (e.g. queue removed in the
+        dashboard), the consumer recreates and re-registers it instead of
+        spinning on NOGROUP errors."""
+        broker.declare_queue("work")
+        consumer = broker.consume("work", timeout=200)
+        sk = stream_key("work", broker.namespace)
+        redis_client.xgroup_destroy(sk, GROUP_NAME)
+
+        # Heals rather than raising; returns None this cycle.
+        assert next(consumer) is None
+
+        groups = {
+            (g.get("name").decode() if isinstance(g.get("name"), bytes) else g.get("name"))
+            for g in redis_client.xinfo_groups(sk)
+        }
+        assert GROUP_NAME in groups
+        members = {
+            m.decode() if isinstance(m, bytes) else m
+            for m in redis_client.smembers(queues_key(broker.namespace))
+        }
+        assert "work" in members
+        consumer.close()

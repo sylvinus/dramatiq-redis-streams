@@ -2,7 +2,7 @@
 
 import dramatiq
 
-from ..keys import delayed_key, dlq_stream_key, stream_key, GROUP_NAME
+from ..keys import delayed_key, dlq_stream_key, queues_key, stream_key, GROUP_NAME
 
 
 def _decode_stream_entry(entry_id, entry_data):
@@ -33,20 +33,22 @@ def _decode_stream_entry(entry_id, entry_data):
 
 
 def _discover_queues(client, namespace, declared_queues):
-    """Merge declared queues with queues discovered via SCAN."""
+    """Return all known queues: the declared set unioned with the shared
+    registry (``<namespace>:queues``).
+
+    The registry is populated by workers (on consume), so a single ``SMEMBERS``
+    lists every queue — no keyspace ``SCAN``.
+    """
     queues = set(declared_queues)
-    prefix = f"{namespace}:stream:"
-    cursor = 0
-    while True:
-        cursor, keys = client.scan(cursor, match=f"{prefix}*", count=200)
-        for k in keys:
-            key_str = k if isinstance(k, str) else k.decode()
-            queue_name = key_str[len(prefix):]
-            # Skip delay queues (*.DQ suffix)
-            if not queue_name.endswith(".DQ"):
-                queues.add(queue_name)
-        if cursor == 0:
-            break
+    try:
+        members = client.smembers(queues_key(namespace))
+    except Exception:
+        members = []
+    for m in members:
+        name = m.decode() if isinstance(m, bytes) else m
+        # Defensive: never surface delay-queue names.
+        if not name.endswith(".DQ"):
+            queues.add(name)
     return sorted(queues)
 
 
@@ -188,6 +190,44 @@ def requeue_dlq_message(client, namespace, queue_name, stream_id):
         return False
 
 
+def requeue_all_dlq(client, namespace, queue_name, batch=500):
+    """Move every message from a queue's DLQ back to the main stream.
+
+    Returns the number of messages requeued. Messages are moved oldest-first so
+    FIFO order is preserved, in batches to bound memory on large DLQs. Each
+    batch is read then re-added/deleted; because entries are deleted as they are
+    processed, the next read returns the remaining ones.
+    """
+    dk = dlq_stream_key(queue_name, namespace)
+    sk = stream_key(queue_name, namespace)
+    moved = 0
+    while True:
+        try:
+            entries = client.xrange(dk, count=batch)
+        except Exception:
+            break
+        if not entries:
+            break
+        pipe = client.pipeline(transaction=False)
+        n = 0
+        for eid, edata in entries:
+            raw = edata.get(b"data") or edata.get("data")
+            if raw is not None:
+                pipe.xadd(sk, {"data": raw})
+                n += 1
+            # Delete every entry we read (including corrupt ones) so the DLQ
+            # strictly shrinks and we never loop on an un-requeueable message.
+            pipe.xdel(dk, eid)
+        try:
+            pipe.execute()
+        except Exception:
+            break
+        moved += n
+        if len(entries) < batch:
+            break
+    return moved
+
+
 def purge_dlq(client, namespace, queue_name):
     """Delete all messages from a queue's DLQ. Returns count deleted."""
     dk = dlq_stream_key(queue_name, namespace)
@@ -197,6 +237,23 @@ def purge_dlq(client, namespace, queue_name):
         return count
     except Exception:
         return 0
+
+
+def remove_queue(client, namespace, queue_name):
+    """Remove a queue entirely: registry entry, main stream, and DLQ stream.
+
+    Intended for cleaning up queues that are no longer used; the dashboard only
+    offers it for empty queues. If a worker is still consuming the queue it will
+    transparently recreate and re-register it (see the consumer's ``NOGROUP``
+    recovery), so an in-use queue simply reappears. Returns True on success.
+    """
+    try:
+        client.srem(queues_key(namespace), queue_name)
+        client.delete(stream_key(queue_name, namespace))
+        client.delete(dlq_stream_key(queue_name, namespace))
+        return True
+    except Exception:
+        return False
 
 
 def flush_queue(client, namespace, queue_name):

@@ -1,9 +1,14 @@
 import dramatiq
 
 from dramatiq_redis_streams.delayed import DelayedScheduler
-from dramatiq_redis_streams.keys import delayed_key, stream_key
+from dramatiq_redis_streams.keys import GROUP_NAME, delayed_key, stream_key
 
 from .conftest import make_message, wait_for
+
+
+def _consumer_names(redis_client, queue, namespace="dramatiq"):
+    consumers = redis_client.xinfo_consumers(stream_key(queue, namespace), GROUP_NAME)
+    return {c["name"].decode() if isinstance(c["name"], bytes) else c["name"] for c in consumers}
 
 
 # ---------------------------------------------------------------------------
@@ -109,3 +114,57 @@ class TestDelayedScheduler:
         scheduler.stop()
         scheduler.join(timeout=3)
         assert not scheduler.is_alive()
+
+
+# ---------------------------------------------------------------------------
+# Stale-consumer reaper
+# ---------------------------------------------------------------------------
+
+class TestConsumerReaper:
+    def test_reaps_drained_idle_consumer(self, broker, redis_client):
+        broker.declare_queue("work")
+        broker.enqueue(make_message(queue="work"))
+        consumer = broker.consume("work", prefetch=1, timeout=500)
+        msg = next(consumer)
+        consumer.ack(msg)  # pending now 0
+        name = consumer._consumer_name
+        assert name in _consumer_names(redis_client, "work")
+
+        # reap_min_idle_ms=0 → any drained consumer is eligible immediately.
+        sched = DelayedScheduler(broker, reap_min_idle_ms=0)
+        reaped = sched._reap_consumers()
+
+        assert reaped >= 1
+        assert name not in _consumer_names(redis_client, "work")
+        consumer.close()
+
+    def test_does_not_reap_consumer_with_pending(self, broker, redis_client):
+        broker.declare_queue("work")
+        broker.enqueue(make_message(queue="work"))
+        consumer = broker.consume("work", prefetch=1, timeout=500)
+        msg = next(consumer)  # delivered, NOT acked → pending 1
+        name = consumer._consumer_name
+
+        sched = DelayedScheduler(broker, reap_min_idle_ms=0)
+        reaped = sched._reap_consumers()
+
+        assert reaped == 0
+        assert name in _consumer_names(redis_client, "work")
+        consumer.ack(msg)
+        consumer.close()
+
+    def test_does_not_reap_recently_active_consumer(self, broker, redis_client):
+        broker.declare_queue("work")
+        broker.enqueue(make_message(queue="work"))
+        consumer = broker.consume("work", prefetch=1, timeout=500)
+        msg = next(consumer)
+        consumer.ack(msg)  # drained, but just now → low idle
+        name = consumer._consumer_name
+
+        # High idle threshold → a just-active consumer is not eligible.
+        sched = DelayedScheduler(broker, reap_min_idle_ms=3_600_000)
+        reaped = sched._reap_consumers()
+
+        assert reaped == 0
+        assert name in _consumer_names(redis_client, "work")
+        consumer.close()

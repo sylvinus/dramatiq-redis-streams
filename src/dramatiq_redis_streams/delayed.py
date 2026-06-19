@@ -5,7 +5,7 @@ import time
 import dramatiq
 import redis as redis_mod
 
-from .keys import delayed_key, stream_key
+from .keys import GROUP_NAME, delayed_key, stream_key
 
 logger = logging.getLogger(__name__)
 
@@ -22,20 +22,35 @@ class DelayedScheduler(threading.Thread):
         broker: The parent :class:`StreamsBroker`.
         interval: Seconds to sleep between polls when idle (default 1.0).
         batch_size: Maximum messages to process per cycle (default 100).
+        reap_interval: Seconds between stale-consumer sweeps (default 60).
+        reap_min_idle_ms: Minimum consumer idle time, in milliseconds, before a
+            drained consumer is removed (default 1 hour).
     """
 
-    def __init__(self, broker, *, interval=1.0, batch_size=100):
+    def __init__(
+        self,
+        broker,
+        *,
+        interval=1.0,
+        batch_size=100,
+        reap_interval=60.0,
+        reap_min_idle_ms=3_600_000,
+    ):
         super().__init__(daemon=True, name="DelayedScheduler")
         self.broker = broker
         self.interval = interval
         self.batch_size = batch_size
+        self.reap_interval = reap_interval
+        self.reap_min_idle_ms = reap_min_idle_ms
         self._stop_event = threading.Event()
+        self._last_reap = 0.0
 
     def run(self):
         logger.debug("Delayed scheduler started (interval=%.1fs)", self.interval)
         while not self._stop_event.is_set():
             try:
                 moved = self._process()
+                self._maybe_reap()
                 if moved == 0:
                     self._stop_event.wait(self.interval)
                 # If messages were moved, loop immediately to check for more.
@@ -81,3 +96,61 @@ class DelayedScheduler(threading.Thread):
                     except Exception:
                         logger.error("Delayed message lost — ZREM succeeded but XADD and re-ZADD both failed", exc_info=True)
         return moved
+
+    def _maybe_reap(self):
+        """Run the stale-consumer sweep if ``reap_interval`` has elapsed."""
+        now = time.monotonic()
+        if now - self._last_reap < self.reap_interval:
+            return
+        self._last_reap = now
+        try:
+            self._reap_consumers()
+        except redis_mod.ConnectionError:
+            logger.warning("Redis connection lost while reaping consumers")
+        except Exception:
+            logger.warning("Consumer reaper error", exc_info=True)
+
+    def _reap_consumers(self):
+        """Remove stale, fully-drained consumers from each stream's group.
+
+        Only the broker's **declared** queues are swept (one ``XINFO CONSUMERS``
+        per queue) — never a keyspace ``SCAN``, which would walk every key in a
+        possibly-shared Redis on each sweep. A worker process declares the
+        queues it consumes, so a live worker reaps the dead consumers on exactly
+        those streams; queues with no live worker have no scheduler to reap them
+        and their idle consumers are inert anyway.
+
+        A consumer is deleted only when it owns **no** pending messages and has
+        been idle longer than ``reap_min_idle_ms`` — by which point
+        ``XAUTOCLAIM`` (see :class:`~dramatiq_redis_streams.consumer.StreamsConsumer`)
+        has long since recovered any work it held. ``XGROUP DELCONSUMER`` is
+        idempotent, so multiple scheduler processes racing to reap the same
+        consumer is harmless.
+
+        Returns the number of consumers reaped.
+        """
+        client = self.broker.client
+        namespace = self.broker.namespace
+        reaped = 0
+        for queue_name in self.broker.get_declared_queues():
+            sk = stream_key(queue_name, namespace)
+            try:
+                consumers = client.xinfo_consumers(sk, GROUP_NAME)
+            except redis_mod.ResponseError:
+                continue
+            for c in consumers:
+                if c.get("pending", 0) != 0:
+                    continue
+                if c.get("idle", 0) < self.reap_min_idle_ms:
+                    continue
+                name = c.get("name", b"")
+                if isinstance(name, bytes):
+                    name = name.decode()
+                try:
+                    client.xgroup_delconsumer(sk, GROUP_NAME, name)
+                    reaped += 1
+                except redis_mod.ResponseError:
+                    pass
+        if reaped:
+            logger.debug("Reaped %d stale consumer(s)", reaped)
+        return reaped

@@ -1,7 +1,7 @@
 import dramatiq
 import pytest
 
-from dramatiq_redis_streams.keys import GROUP_NAME, delayed_key, stream_key
+from dramatiq_redis_streams.keys import GROUP_NAME, delayed_key, queues_key, stream_key
 
 from .conftest import make_message
 
@@ -45,6 +45,23 @@ class TestDeclareQueue:
         for name in ["alpha", "beta", "gamma"]:
             broker.declare_queue(name)
         assert {"alpha", "beta", "gamma"} <= broker.queues
+
+
+class TestQueueRegistry:
+    def test_consume_registers_queue(self, broker, redis_client):
+        """Workers register the queues they consume in the shared registry."""
+        consumer = broker.consume("test-queue", timeout=100)
+        members = {
+            m.decode() if isinstance(m, bytes) else m
+            for m in redis_client.smembers(queues_key(broker.namespace))
+        }
+        assert "test-queue" in members
+        consumer.close()
+
+    def test_declare_queue_does_not_register(self, broker, redis_client):
+        """Declaring alone is Redis-free, so it must not touch the registry."""
+        broker.declare_queue("test-queue")
+        assert not redis_client.exists(queues_key(broker.namespace))
 
 
 class TestConsumeCreatesGroup:

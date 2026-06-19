@@ -3,7 +3,7 @@
 import dramatiq
 
 from dramatiq_redis_streams.dashboard import api
-from dramatiq_redis_streams.keys import dlq_stream_key, stream_key
+from dramatiq_redis_streams.keys import dlq_stream_key, queues_key, stream_key
 
 
 def make_message(queue="test-queue", actor="test-actor", args=(), kwargs=None):
@@ -81,9 +81,9 @@ class TestGetOverview:
         assert q["lag"] is None
 
     def test_discovers_undeclared_queues(self, broker, redis_client):
-        """Queues created by other processes are discovered via SCAN."""
-        sk = stream_key("other-process-queue", broker.namespace)
-        redis_client.xadd(sk, {"data": b"test"})
+        """Queues registered by other processes (in the registry set) are
+        discovered without this process declaring them."""
+        redis_client.sadd(queues_key(broker.namespace), "other-process-queue")
         result = api.get_overview(redis_client, broker.namespace, broker.get_declared_queues())
         names = [q["name"] for q in result["queues"]]
         assert "other-process-queue" in names
@@ -183,6 +183,40 @@ class TestRequeueDlqMessage:
         assert result is False
 
 
+class TestRequeueAllDlq:
+    def test_requeue_all_moves_everything_in_order(self, broker, redis_client):
+        dk = dlq_stream_key("work", broker.namespace)
+        sk = stream_key("work", broker.namespace)
+        for i in range(5):
+            redis_client.xadd(dk, {"data": make_message(queue="work", actor=f"a{i}").encode()})
+
+        count = api.requeue_all_dlq(redis_client, broker.namespace, "work")
+        assert count == 5
+        assert redis_client.xlen(dk) == 0
+        assert redis_client.xlen(sk) == 5
+
+        # FIFO order preserved (a0..a4).
+        actors = [
+            dramatiq.Message.decode(edata.get(b"data") or edata.get("data")).actor_name
+            for _eid, edata in redis_client.xrange(sk)
+        ]
+        assert actors == [f"a{i}" for i in range(5)]
+
+    def test_requeue_all_handles_batches(self, broker, redis_client):
+        dk = dlq_stream_key("work", broker.namespace)
+        sk = stream_key("work", broker.namespace)
+        for i in range(12):
+            redis_client.xadd(dk, {"data": make_message(queue="work", actor=f"a{i}").encode()})
+        count = api.requeue_all_dlq(redis_client, broker.namespace, "work", batch=5)
+        assert count == 12
+        assert redis_client.xlen(dk) == 0
+        assert redis_client.xlen(sk) == 12
+
+    def test_requeue_all_empty(self, broker, redis_client):
+        count = api.requeue_all_dlq(redis_client, broker.namespace, "work")
+        assert count == 0
+
+
 class TestPurgeDlq:
     def test_purge(self, broker, redis_client):
         dk = dlq_stream_key("work", broker.namespace)
@@ -206,6 +240,19 @@ class TestFlushQueue:
         assert redis_client.xlen(sk) == 2
         api.flush_queue(redis_client, broker.namespace, "work")
         assert redis_client.xlen(sk) == 0
+
+
+class TestRemoveQueue:
+    def test_removes_stream_dlq_and_registry(self, broker, redis_client):
+        redis_client.sadd(queues_key(broker.namespace), "work")
+        redis_client.xadd(stream_key("work", broker.namespace), {"data": b"x"})
+        redis_client.xadd(dlq_stream_key("work", broker.namespace), {"data": b"y"})
+
+        assert api.remove_queue(redis_client, broker.namespace, "work") is True
+        assert not redis_client.exists(stream_key("work", broker.namespace))
+        assert not redis_client.exists(dlq_stream_key("work", broker.namespace))
+        members = redis_client.smembers(queues_key(broker.namespace))
+        assert b"work" not in members and "work" not in members
 
 
 class TestGetWorkers:

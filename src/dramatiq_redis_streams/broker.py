@@ -8,7 +8,7 @@ import redis as redis_mod
 
 from .consumer import StreamsConsumer
 from .delayed import DelayedScheduler
-from .keys import GROUP_NAME, delayed_key, stream_key
+from .keys import GROUP_NAME, delayed_key, queues_key, stream_key
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,8 @@ class StreamsBroker(dramatiq.Broker):
         self._scheduler = None
         self._scheduler_started = False
         self._scheduler_lock = threading.Lock()
+        # Queues this process has already added to the shared registry set.
+        self._registered = set()
 
     def _ensure_group(self, key):
         """Create a consumer group on a stream, idempotently."""
@@ -53,6 +55,25 @@ class StreamsBroker(dramatiq.Broker):
         except redis_mod.ResponseError as e:
             if "BUSYGROUP" not in str(e):
                 raise
+
+    def _register_queue(self, queue_name, force=False):
+        """Record *queue_name* in the shared registry set, once per process.
+
+        Workers populate this set (on :meth:`consume`); the dashboard reads it
+        with a single ``SMEMBERS`` to list every queue, avoiding a keyspace
+        ``SCAN``. Best-effort and idempotent — :meth:`declare_queue` stays
+        Redis-free, so registration happens lazily here instead.
+
+        ``force`` re-registers even if already cached — used when a consumer
+        recovers from a removed group so the queue reappears in the registry.
+        """
+        if queue_name in self._registered and not force:
+            return
+        try:
+            self.client.sadd(queues_key(self.namespace), queue_name)
+        except redis_mod.RedisError:
+            return  # best-effort; retried on the next consume()
+        self._registered.add(queue_name)
 
     def _start_scheduler(self):
         """Start the delayed-message scheduler if not already running."""
@@ -109,6 +130,8 @@ class StreamsBroker(dramatiq.Broker):
         # Create the consumer group lazily, here at worker startup — not in
         # declare_queue — so that importing task modules never needs Redis.
         self._ensure_group(stream_key(queue_name, self.namespace))
+        # Register the queue so the dashboard can discover it without a SCAN.
+        self._register_queue(queue_name)
         self._start_scheduler()
         return StreamsConsumer(
             broker=self,

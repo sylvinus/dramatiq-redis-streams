@@ -64,7 +64,7 @@ HTML_PAGE = """\
 <body>
 <header>
   <div class="container">
-    <h1>Dramatiq Streams</h1>
+    <h1><a href="#/" style="color:inherit;text-decoration:none">Dramatiq Streams</a></h1>
     <nav>
       <a href="#/">Overview</a>
       <a href="#/workers">Workers</a>
@@ -181,7 +181,12 @@ HTML_PAGE = """\
       h += '<td>' + q.pending + '</td>';
       h += '<td>' + fmtRate(q._rate) + '</td>';
       h += '<td>' + (q.dlq_length > 0 ? '<a href="#/queue/' + encodeURIComponent(q.name) + '/dlq"><span class="badge badge-red">' + q.dlq_length + '</span></a>' : '<span class="badge badge-gray">0</span>') + '</td>';
-      h += '<td><button class="btn btn-danger" onclick="flushQueue(\\'' + esc(q.name) + '\\')">Flush</button></td>';
+      // Empty queues can be removed entirely; non-empty ones can be flushed.
+      if (q.stream_length === 0 && q.dlq_length === 0) {
+        h += '<td><button class="btn btn-danger" onclick="removeQueue(\\'' + esc(q.name) + '\\')">Remove</button></td>';
+      } else {
+        h += '<td><button class="btn btn-danger" onclick="flushQueue(\\'' + esc(q.name) + '\\')">Flush</button></td>';
+      }
       h += '</tr>';
     });
     h += '</table>';
@@ -198,7 +203,10 @@ HTML_PAGE = """\
     h += '</div>';
     h += '<h2>' + esc(queue) + (isDlq ? ' — Dead Letter Queue' : ' — Messages') + '</h2>';
     if (isDlq) {
-      h += '<div style="margin-bottom:12px"><button class="btn btn-danger" onclick="purgeDlq(\\'' + esc(queue) + '\\')">Purge All</button></div>';
+      h += '<div style="margin-bottom:12px">';
+      h += '<button class="btn btn-primary" onclick="requeueAllDlq(\\'' + esc(queue) + '\\')">Requeue All</button>';
+      h += '<button class="btn btn-danger" onclick="purgeDlq(\\'' + esc(queue) + '\\')">Purge All</button>';
+      h += '</div>';
     }
     if (!msgs.length) {
       h += '<div class="empty">No messages.</div>';
@@ -261,6 +269,43 @@ HTML_PAGE = """\
     return '<span class="badge ' + cls + '">' + status + '</span>';
   }
 
+  function renderWorkerCard(w) {
+    var h = '<div class="worker-card">';
+    h += '<h3><span class="mono">' + esc(w.name) + '</span> ' + statusBadge(w.status) + '</h3>';
+    h += '<div class="worker-meta">';
+    h += '<span>Idle: <strong>' + fmtIdle(w.idle_ms) + '</strong></span>';
+    h += '<span>Pending: <strong>' + w.total_pending + '</strong></span>';
+    h += '<span>Queues: ' + w.queues.map(function(q) {
+      var det = w.queue_details[q];
+      var pending = det ? det.pending : 0;
+      var label = esc(q);
+      if (pending > 0) label += '&nbsp;<span class="badge badge-blue">' + pending + '</span>';
+      return '<a href="#/queue/' + encodeURIComponent(q) + '">' + label + '</a>';
+    }).join(', ') + '</span>';
+    h += '</div>';
+    if (w.pending_messages.length) {
+      h += '<div class="pending-table">';
+      h += '<table><tr><th>Stream ID</th><th>Queue</th><th>Actor</th><th>Idle</th><th>Deliveries</th></tr>';
+      w.pending_messages.forEach(function(pm) {
+        h += '<tr>';
+        h += '<td class="mono">' + esc(pm.id) + '</td>';
+        h += '<td>' + esc(pm.queue) + '</td>';
+        h += '<td>' + esc(pm.actor) + '</td>';
+        h += '<td>' + fmtIdle(pm.idle_ms) + '</td>';
+        h += '<td>' + pm.deliveries + '</td>';
+        h += '</tr>';
+      });
+      h += '</table>';
+      if (w.total_pending > w.pending_messages.length) {
+        h += '<div style="font-size:12px;color:#636e72;margin-top:6px">Showing ' +
+             w.pending_messages.length + ' of ' + w.total_pending + ' pending messages.</div>';
+      }
+      h += '</div>';
+    }
+    h += '</div>';
+    return h;
+  }
+
   function renderWorkers(workers) {
     var h = '<div class="breadcrumb"><a href="#/">Overview</a> &rsaquo; Workers</div>';
     h += '<h2>Workers</h2>';
@@ -268,41 +313,24 @@ HTML_PAGE = """\
       h += '<div class="empty">No active workers found.</div>';
       return h;
     }
-    workers.forEach(function(w) {
-      h += '<div class="worker-card">';
-      h += '<h3><span class="mono">' + esc(w.name) + '</span> ' + statusBadge(w.status) + '</h3>';
-      h += '<div class="worker-meta">';
-      h += '<span>Idle: <strong>' + fmtIdle(w.idle_ms) + '</strong></span>';
-      h += '<span>Pending: <strong>' + w.total_pending + '</strong></span>';
-      h += '<span>Queues: ' + w.queues.map(function(q) {
-        var det = w.queue_details[q];
-        var pending = det ? det.pending : 0;
-        var label = esc(q);
-        if (pending > 0) label += '&nbsp;<span class="badge badge-blue">' + pending + '</span>';
-        return '<a href="#/queue/' + encodeURIComponent(q) + '">' + label + '</a>';
-      }).join(', ') + '</span>';
-      h += '</div>';
-      if (w.pending_messages.length) {
-        h += '<div class="pending-table">';
-        h += '<table><tr><th>Stream ID</th><th>Queue</th><th>Actor</th><th>Idle</th><th>Deliveries</th></tr>';
-        w.pending_messages.forEach(function(pm) {
-          h += '<tr>';
-          h += '<td class="mono">' + esc(pm.id) + '</td>';
-          h += '<td>' + esc(pm.queue) + '</td>';
-          h += '<td>' + esc(pm.actor) + '</td>';
-          h += '<td>' + fmtIdle(pm.idle_ms) + '</td>';
-          h += '<td>' + pm.deliveries + '</td>';
-          h += '</tr>';
-        });
-        h += '</table>';
-        if (w.total_pending > w.pending_messages.length) {
-          h += '<div style="font-size:12px;color:#636e72;margin-top:6px">Showing ' +
-               w.pending_messages.length + ' of ' + w.total_pending + ' pending messages.</div>';
-        }
-        h += '</div>';
-      }
-      h += '</div>';
-    });
+
+    // Active workers first, sorted by name; everyone else sorted by idle ascending.
+    var active = workers.filter(function(w) { return w.status === 'active'; })
+                        .sort(function(a, b) { return a.name < b.name ? -1 : a.name > b.name ? 1 : 0; });
+    var others = workers.filter(function(w) { return w.status !== 'active'; })
+                        .sort(function(a, b) { return a.idle_ms - b.idle_ms; });
+
+    h += '<h3 style="margin:8px 0 12px">Active <span class="badge badge-green">' + active.length + '</span></h3>';
+    if (active.length) {
+      active.forEach(function(w) { h += renderWorkerCard(w); });
+    } else {
+      h += '<div class="empty">No active workers.</div>';
+    }
+
+    if (others.length) {
+      h += '<h3 style="margin:20px 0 12px">Idle / Stale <span class="badge badge-gray">' + others.length + '</span></h3>';
+      others.forEach(function(w) { h += renderWorkerCard(w); });
+    }
     return h;
   }
 
@@ -339,9 +367,17 @@ HTML_PAGE = """\
     if (!confirm('Flush all messages from "' + name + '"?')) return;
     api('/api/queues/' + encodeURIComponent(name) + '/flush', {method:'POST'}).then(route);
   };
+  window.removeQueue = function(name) {
+    if (!confirm('Remove empty queue "' + name + '" from the dashboard?')) return;
+    api('/api/queues/' + encodeURIComponent(name) + '/remove', {method:'POST'}).then(route);
+  };
   window.purgeDlq = function(name) {
     if (!confirm('Purge all DLQ messages for "' + name + '"?')) return;
     api('/api/queues/' + encodeURIComponent(name) + '/dlq/purge', {method:'POST'}).then(route);
+  };
+  window.requeueAllDlq = function(name) {
+    if (!confirm('Requeue all DLQ messages for "' + name + '" back to the main queue?')) return;
+    api('/api/queues/' + encodeURIComponent(name) + '/dlq/requeue-all', {method:'POST'}).then(route);
   };
   window.requeueMsg = function(queue, id) {
     api('/api/queues/' + encodeURIComponent(queue) + '/dlq/' + encodeURIComponent(id) + '/requeue', {method:'POST'}).then(route);

@@ -3,7 +3,7 @@
 import dramatiq
 
 from dramatiq_redis_streams.dashboard import api
-from dramatiq_redis_streams.keys import dlq_stream_key, queues_key, stream_key
+from dramatiq_redis_streams.keys import ABANDONED_CONSUMER, dlq_expiry_key, dlq_stream_key, queues_key, stream_key
 
 
 def make_message(queue="test-queue", actor="test-actor", args=(), kwargs=None):
@@ -133,6 +133,17 @@ class TestGetDlqMessages:
         assert len(result) == 1
         assert result[0]["actor"] == "failed_task"
 
+    def test_surfaces_error_and_retries(self, broker, redis_client):
+        """The failure traceback and retry count are surfaced for triage."""
+        dk = dlq_stream_key("work", broker.namespace)
+        msg = make_message(queue="work", actor="boom")
+        msg.options["traceback"] = "Traceback (most recent call last):\n ...\nValueError: boom"
+        msg.options["retries"] = 3
+        redis_client.xadd(dk, {"data": msg.encode()})
+        result = api.get_dlq_messages(redis_client, broker.namespace, "work")
+        assert "ValueError: boom" in result[0]["error"]
+        assert result[0]["retries"] == 3
+
 
 class TestGetDelayedMessages:
     def test_empty(self, broker, redis_client):
@@ -230,6 +241,14 @@ class TestPurgeDlq:
         count = api.purge_dlq(redis_client, broker.namespace, "work")
         assert count == 0
 
+    def test_purge_clears_expiry_index(self, broker, redis_client):
+        dk = dlq_stream_key("work", broker.namespace)
+        ek = dlq_expiry_key("work", broker.namespace)
+        redis_client.xadd(dk, {"data": b"x"})
+        redis_client.zadd(ek, {"1-0": 12345})
+        api.purge_dlq(redis_client, broker.namespace, "work")
+        assert redis_client.exists(ek) == 0
+
 
 class TestFlushQueue:
     def test_flush(self, broker, redis_client):
@@ -283,6 +302,20 @@ class TestGetWorkers:
 
         consumer.ack(msg)
         consumer.close()
+
+    def test_abandoned_sentinel_hidden(self, broker, redis_client):
+        """The abandoned-message sentinel consumer is not shown as a worker."""
+        broker.declare_queue("work")
+        for i in range(3):
+            broker.enqueue(make_message(queue="work", actor=f"a{i}"))
+        consumer = broker.consume("work", prefetch=3, timeout=100)
+        next(consumer)        # reads 3, returns 1; 2 remain buffered
+        consumer.close()      # abandons the 2 → creates the sentinel consumer
+
+        result = api.get_workers(redis_client, broker.namespace, broker.get_declared_queues())
+        names = [w["name"] for w in result]
+        assert ABANDONED_CONSUMER not in names
+        assert any(n.startswith("worker-") for n in names)
 
     def test_worker_across_multiple_queues(self, broker, redis_client):
         """A worker consuming from two queues is aggregated into one entry."""
@@ -347,6 +380,170 @@ class TestGetWorkers:
         assert worker["pending_messages"] == []
 
         consumer.ack(msg)
+        consumer.close()
+
+
+def _id_key(stream_id):
+    """Sort key matching Redis stream-ID ordering: numeric (ms, seq), not the
+    lexicographic order Python's default string sort would give (which puts
+    '...-10' before '...-2')."""
+    ms, _, seq = stream_id.partition("-")
+    return (int(ms), int(seq))
+
+
+class TestWorkerPendingPagination:
+    def _worker_name(self, redis_client, broker, declared):
+        result = api.get_workers(redis_client, broker.namespace, declared)
+        return next(w["name"] for w in result if w["name"].startswith("worker-"))
+
+    def test_walks_entire_pel_in_pages(self, broker, redis_client):
+        """Seek pagination returns every pending task exactly once, in order."""
+        broker.declare_queue("work")
+        for i in range(25):
+            broker.enqueue(make_message(queue="work", actor=f"a{i}"))
+        consumer = broker.consume("work", prefetch=25, timeout=1000)
+        msgs = [next(consumer) for _ in range(25)]
+        declared = broker.get_declared_queues()
+        wname = self._worker_name(redis_client, broker, declared)
+
+        seen, cursor, pages = [], None, 0
+        while True:
+            page = api.get_worker_pending(
+                redis_client, broker.namespace, wname, declared,
+                after=cursor, count=10,
+            )
+            seen.extend(m["id"] for m in page["messages"])
+            pages += 1
+            assert pages < 10  # guard against a cursor that never terminates
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+
+        assert len(seen) == 25                      # every pending task...
+        assert len(set(seen)) == 25                 # ...exactly once (no overlap)
+        assert seen == sorted(seen, key=_id_key)    # ascending stream-id order
+        assert pages == 3                           # 10 + 10 + 5
+
+        for m in msgs:
+            consumer.ack(m)
+        consumer.close()
+
+    def test_continues_from_get_workers_cursor(self, broker, redis_client):
+        """The cursor embedded in get_workers resumes after its first page."""
+        broker.declare_queue("work")
+        for i in range(25):
+            broker.enqueue(make_message(queue="work", actor=f"a{i}"))
+        consumer = broker.consume("work", prefetch=25, timeout=1000)
+        msgs = [next(consumer) for _ in range(25)]
+        declared = broker.get_declared_queues()
+
+        workers = api.get_workers(
+            redis_client, broker.namespace, declared, pending_limit=10,
+        )
+        worker = next(w for w in workers if w["name"].startswith("worker-"))
+        first_ids = [m["id"] for m in worker["pending_messages"]]
+        assert len(first_ids) == 10
+        assert worker["pending_cursor"] is not None
+
+        rest, cursor = [], worker["pending_cursor"]
+        while cursor is not None:
+            page = api.get_worker_pending(
+                redis_client, broker.namespace, worker["name"], declared,
+                after=cursor, count=10,
+            )
+            rest.extend(m["id"] for m in page["messages"])
+            cursor = page["next_cursor"]
+
+        assert len(rest) == 15                          # the remaining tasks
+        assert set(first_ids).isdisjoint(rest)          # no overlap with page one
+        # First page then the rest is the full PEL in stream-id order.
+        assert first_ids + rest == sorted(first_ids + rest, key=_id_key)
+
+        for m in msgs:
+            consumer.ack(m)
+        consumer.close()
+
+    def test_no_cursor_when_not_truncated(self, broker, redis_client):
+        """A fully-shown worker has no cursor, and its page has no next page."""
+        broker.declare_queue("work")
+        broker.enqueue(make_message(queue="work"))
+        consumer = broker.consume("work", prefetch=1, timeout=1000)
+        msg = next(consumer)
+        declared = broker.get_declared_queues()
+
+        worker = next(
+            w for w in api.get_workers(redis_client, broker.namespace, declared)
+            if w["name"].startswith("worker-")
+        )
+        assert worker["pending_cursor"] is None
+
+        page = api.get_worker_pending(
+            redis_client, broker.namespace, worker["name"], declared, count=10,
+        )
+        assert len(page["messages"]) == 1
+        assert page["next_cursor"] is None
+
+        consumer.ack(msg)
+        consumer.close()
+
+    def test_paginates_across_multiple_queues(self, broker, redis_client):
+        """A page boundary that falls between two queues is handled cleanly."""
+        broker.declare_queue("q1")
+        broker.declare_queue("q2")
+        for i in range(5):
+            broker.enqueue(make_message(queue="q1", actor=f"x{i}"))
+        for i in range(5):
+            broker.enqueue(make_message(queue="q2", actor=f"y{i}"))
+        c1 = broker.consume("q1", prefetch=5, timeout=1000)
+        c2 = broker.consume("q2", prefetch=5, timeout=1000)
+        m1 = [next(c1) for _ in range(5)]
+        m2 = [next(c2) for _ in range(5)]
+        declared = broker.get_declared_queues()
+        wname = self._worker_name(redis_client, broker, declared)
+
+        seen, cursor = [], None
+        while True:
+            page = api.get_worker_pending(
+                redis_client, broker.namespace, wname, declared,
+                after=cursor, count=3,  # small page → boundary crosses queues
+            )
+            seen.extend((m["queue"], m["id"]) for m in page["messages"])
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+
+        assert len(seen) == 10
+        assert len(set(seen)) == 10                 # each entry once
+        queues_seen = [q for q, _ in seen]
+        assert queues_seen == sorted(queues_seen)   # all q1, then all q2
+        assert queues_seen.count("q1") == 5
+        assert queues_seen.count("q2") == 5
+
+        for m in m1:
+            c1.ack(m)
+        for m in m2:
+            c2.ack(m)
+        c1.close()
+        c2.close()
+
+    def test_bad_cursor_starts_from_beginning(self, broker, redis_client):
+        """A malformed cursor degrades to the first page rather than erroring."""
+        broker.declare_queue("work")
+        for i in range(3):
+            broker.enqueue(make_message(queue="work", actor=f"a{i}"))
+        consumer = broker.consume("work", prefetch=3, timeout=1000)
+        msgs = [next(consumer) for _ in range(3)]
+        declared = broker.get_declared_queues()
+        wname = self._worker_name(redis_client, broker, declared)
+
+        page = api.get_worker_pending(
+            redis_client, broker.namespace, wname, declared,
+            after="not-a-real-cursor", count=10,
+        )
+        assert len(page["messages"]) == 3
+
+        for m in msgs:
+            consumer.ack(m)
         consumer.close()
 
     def test_no_pending_after_ack(self, broker, redis_client):

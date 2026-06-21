@@ -3,11 +3,12 @@ import time
 
 import dramatiq
 import pytest
+from dramatiq import Worker
 
 from dramatiq_redis_streams import StreamsBroker
 from dramatiq_redis_streams.keys import dlq_stream_key
 
-from .conftest import make_message
+from .conftest import make_message, wait_for
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +138,36 @@ class TestMultiQueue:
 # ---------------------------------------------------------------------------
 # Concurrency
 # ---------------------------------------------------------------------------
+
+class TestRealWorker:
+    """End-to-end through dramatiq's actual Worker machinery (not just
+    broker.consume) — the seam where prefetch/ack/reclaim bugs hide."""
+
+    @pytest.mark.timeout(20)
+    def test_worker_processes_all_messages(self, broker):
+        dramatiq.set_broker(broker)
+        processed = []
+        lock = threading.Lock()
+
+        @dramatiq.actor(queue_name="rw")
+        def record(x):
+            with lock:
+                processed.append(x)
+
+        for i in range(30):
+            record.send(i)
+
+        worker = Worker(broker, worker_threads=2)
+        worker.start()
+        try:
+            ok = wait_for(lambda: len(processed) >= 30, timeout=15)
+            assert ok, f"processed only {len(processed)}/30"
+            # Exactly-once under the happy path (no duplicates from over-reserve
+            # or premature reclaim).
+            assert sorted(processed) == list(range(30))
+        finally:
+            worker.stop()
+
 
 class TestConcurrency:
     @pytest.mark.timeout(15)

@@ -1,8 +1,19 @@
 """Data layer for the dashboard — pure functions operating on Redis."""
 
+import base64
+import json
+
 import dramatiq
 
-from ..keys import delayed_key, dlq_stream_key, queues_key, stream_key, GROUP_NAME
+from ..keys import (
+    ABANDONED_CONSUMER,
+    GROUP_NAME,
+    delayed_key,
+    dlq_expiry_key,
+    dlq_stream_key,
+    queues_key,
+    stream_key,
+)
 
 
 def _decode_stream_entry(entry_id, entry_data):
@@ -19,6 +30,9 @@ def _decode_stream_entry(entry_id, entry_data):
             "kwargs": msg.kwargs,
             "queue": msg.queue_name,
             "timestamp": msg.message_timestamp,
+            # Failure context for dead-lettered messages (None for live ones).
+            "error": msg.options.get("traceback"),
+            "retries": msg.options.get("retries"),
         }
     except Exception:
         eid = entry_id if isinstance(entry_id, str) else entry_id.decode()
@@ -29,6 +43,8 @@ def _decode_stream_entry(entry_id, entry_data):
             "kwargs": {},
             "queue": "",
             "timestamp": 0,
+            "error": None,
+            "retries": None,
         }
 
 
@@ -228,6 +244,10 @@ def requeue_all_dlq(client, namespace, queue_name, batch=500):
         moved += n
         if len(entries) < batch:
             break
+    try:
+        client.delete(dlq_expiry_key(queue_name, namespace))
+    except Exception:
+        pass
     return moved
 
 
@@ -237,6 +257,7 @@ def purge_dlq(client, namespace, queue_name):
     try:
         count = client.xlen(dk)
         client.xtrim(dk, maxlen=0)
+        client.delete(dlq_expiry_key(queue_name, namespace))
         return count
     except Exception:
         return 0
@@ -254,6 +275,7 @@ def remove_queue(client, namespace, queue_name):
         client.srem(queues_key(namespace), queue_name)
         client.delete(stream_key(queue_name, namespace))
         client.delete(dlq_stream_key(queue_name, namespace))
+        client.delete(dlq_expiry_key(queue_name, namespace))
         return True
     except Exception:
         return False
@@ -269,14 +291,67 @@ def flush_queue(client, namespace, queue_name):
         pass
 
 
+def _encode_cursor(queue, msg_id):
+    """Opaque pagination cursor for a (queue, stream-id) resume point."""
+    raw = json.dumps({"q": queue, "id": msg_id}).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _decode_cursor(cursor):
+    """Decode a cursor back to ``(queue, msg_id)``; ``(None, None)`` if invalid."""
+    try:
+        data = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")))
+        return data.get("q"), data.get("id")
+    except Exception:
+        return None, None
+
+
+def _decode_pending_details(client, collected):
+    """Resolve actor names for collected pending entries in one pipeline.
+
+    ``collected`` is a list of ``(qname, stream_key, msg_id, idle_ms,
+    deliveries)``. Bodies are decoded with a single pipeline round-trip instead
+    of one ``XRANGE`` per message — critical when a worker holds many messages.
+    """
+    if not collected:
+        return []
+    pipe = client.pipeline(transaction=False)
+    for _qname, sk, msg_id, _idle, _deliv in collected:
+        pipe.xrange(sk, min=msg_id, max=msg_id, count=1)
+    try:
+        bodies = pipe.execute()
+    except Exception:
+        bodies = [None] * len(collected)
+
+    messages = []
+    for (qname, _sk, msg_id, idle_ms, deliveries), body in zip(collected, bodies):
+        actor = "<unknown>"
+        try:
+            if body:
+                _, edata = body[0]
+                raw = edata.get(b"data") or edata.get("data")
+                if isinstance(raw, str):
+                    raw = raw.encode("utf-8")
+                actor = dramatiq.Message.decode(raw).actor_name
+        except Exception:
+            pass
+        messages.append({
+            "id": msg_id,
+            "queue": qname,
+            "actor": actor,
+            "idle_ms": idle_ms,
+            "deliveries": deliveries,
+        })
+    return messages
+
+
 def _worker_pending_messages(client, namespace, wname, queue_info, limit):
     """Fetch up to ``limit`` pending message details for a single worker.
 
-    The per-message detail list is purely informational, so it is capped at
-    ``limit`` entries regardless of how many messages the worker actually owns.
-    Message bodies (for the actor name) are decoded with a single pipeline
-    round-trip instead of one ``XRANGE`` per message — critical when a worker
-    holds tens of thousands of pending messages.
+    The first page only — queues are walked in **sorted** order (matching
+    :func:`get_worker_pending`), so the last entry returned is a valid resume
+    frontier for cursor pagination. The list is purely informational, so it is
+    capped at ``limit`` regardless of how many messages the worker owns.
     """
     if limit <= 0:
         return []
@@ -284,7 +359,7 @@ def _worker_pending_messages(client, namespace, wname, queue_info, limit):
     # Collect up to `limit` pending entries across the worker's queues. XPENDING
     # itself already returns idle time and delivery count cheaply.
     collected = []  # (qname, stream_key, msg_id, idle_ms, deliveries)
-    for qname, qinfo in queue_info.items():
+    for qname, qinfo in sorted(queue_info.items()):
         if qinfo["pending"] == 0 or len(collected) >= limit:
             continue
         sk = stream_key(qname, namespace)
@@ -307,38 +382,64 @@ def _worker_pending_messages(client, namespace, wname, queue_info, limit):
             if len(collected) >= limit:
                 break
 
-    if not collected:
-        return []
+    return _decode_pending_details(client, collected)
 
-    # Decode all actor names in one pipeline round-trip.
-    pipe = client.pipeline(transaction=False)
-    for _qname, sk, msg_id, _idle, _deliv in collected:
-        pipe.xrange(sk, min=msg_id, max=msg_id, count=1)
-    try:
-        bodies = pipe.execute()
-    except Exception:
-        bodies = [None] * len(collected)
 
-    pending_messages = []
-    for (qname, _sk, msg_id, idle_ms, deliveries), body in zip(collected, bodies):
-        actor = "<unknown>"
+def get_worker_pending(client, namespace, worker_name, declared_queues=(), after=None, count=50):
+    """One seek-paginated page of a worker's pending (in-progress) tasks.
+
+    ``after`` is the opaque ``next_cursor`` from the previous page (``None``
+    starts at the beginning). Pagination is cursor-based on the Redis stream
+    entry ID via ``XPENDING``'s exclusive start (``(id``), so each page costs
+    ``O(count)`` no matter how far in you are, and the live PEL changing between
+    pages can't cause the offset drift a page-number scheme would. Queues are
+    walked in sorted order and entries within a queue ascend by ID, so the
+    cursor ``(queue, id)`` resumes exactly after the last row shown.
+
+    Returns ``{"worker", "messages": [...], "next_cursor": <str|None>}``;
+    ``next_cursor`` is ``None`` once there are no further entries.
+    """
+    if count <= 0:
+        return {"worker": worker_name, "messages": [], "next_cursor": None}
+
+    qnames = sorted(_discover_queues(client, namespace, declared_queues))
+    start_q, start_id = _decode_cursor(after) if after else (None, None)
+
+    collected = []  # (qname, stream_key, msg_id, idle_ms, deliveries)
+    last = None     # (qname, msg_id) of the final entry collected
+    for qname in qnames:
+        if len(collected) >= count:
+            break
+        # Skip queues before the cursor's queue; resume strictly after the
+        # cursor's id within its queue; take queues after it from the start.
+        if start_q is not None and qname < start_q:
+            continue
+        min_arg = "(" + start_id if (start_q is not None and qname == start_q) else "-"
+        sk = stream_key(qname, namespace)
         try:
-            if body:
-                _, edata = body[0]
-                raw = edata.get(b"data") or edata.get("data")
-                if isinstance(raw, str):
-                    raw = raw.encode("utf-8")
-                actor = dramatiq.Message.decode(raw).actor_name
+            details = client.xpending_range(
+                sk, GROUP_NAME, min=min_arg, max="+",
+                count=count - len(collected), consumername=worker_name,
+            )
         except Exception:
-            pass
-        pending_messages.append({
-            "id": msg_id,
-            "queue": qname,
-            "actor": actor,
-            "idle_ms": idle_ms,
-            "deliveries": deliveries,
-        })
-    return pending_messages
+            continue
+        for entry in details:
+            msg_id = entry.get("message_id", b"")
+            if isinstance(msg_id, bytes):
+                msg_id = msg_id.decode()
+            collected.append((
+                qname, sk, msg_id,
+                entry.get("time_since_delivered", 0),
+                entry.get("times_delivered", 1),
+            ))
+            last = (qname, msg_id)
+            if len(collected) >= count:
+                break
+
+    messages = _decode_pending_details(client, collected)
+    # A full page may have more behind it; a short page exhausted the worker.
+    next_cursor = _encode_cursor(last[0], last[1]) if (last and len(collected) >= count) else None
+    return {"worker": worker_name, "messages": messages, "next_cursor": next_cursor}
 
 
 def get_workers(client, namespace, declared_queues=(), pending_limit=20):
@@ -366,6 +467,9 @@ def get_workers(client, namespace, declared_queues=(), pending_limit=20):
             name = c.get("name", b"")
             if isinstance(name, bytes):
                 name = name.decode()
+            # The abandoned-message sentinel is not a real worker.
+            if name == ABANDONED_CONSUMER:
+                continue
             pending = c.get("pending", 0)
             idle = c.get("idle", 0)
 
@@ -397,6 +501,12 @@ def get_workers(client, namespace, declared_queues=(), pending_limit=20):
         pending_messages = _worker_pending_messages(
             client, namespace, wname, queue_info, pending_limit,
         )
+        # Cursor to fetch the page *after* this embedded first page, when the
+        # worker holds more than we showed. None means nothing more to load.
+        pending_cursor = None
+        if pending_messages and total_pending > len(pending_messages):
+            tail = pending_messages[-1]
+            pending_cursor = _encode_cursor(tail["queue"], tail["id"])
 
         result.append({
             "name": wname,
@@ -409,6 +519,7 @@ def get_workers(client, namespace, declared_queues=(), pending_limit=20):
                 for qname, qinfo in queue_info.items()
             },
             "pending_messages": pending_messages,
+            "pending_cursor": pending_cursor,
         })
 
     return result

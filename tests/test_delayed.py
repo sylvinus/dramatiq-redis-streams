@@ -1,7 +1,11 @@
+import time
+
 import dramatiq
 
 from dramatiq_redis_streams.delayed import DelayedScheduler
-from dramatiq_redis_streams.keys import GROUP_NAME, delayed_key, stream_key
+from dramatiq_redis_streams.keys import (
+    ABANDONED_CONSUMER, GROUP_NAME, delayed_key, dlq_expiry_key, dlq_stream_key, stream_key,
+)
 
 from .conftest import make_message, wait_for
 
@@ -117,6 +121,31 @@ class TestDelayedScheduler:
 
 
 # ---------------------------------------------------------------------------
+# Dead-letter expiry (dead_message_ttl)
+# ---------------------------------------------------------------------------
+
+class TestDeadLetterExpiry:
+    def test_expires_only_past_due(self, broker, redis_client):
+        broker.declare_queue("work")
+        dk = dlq_stream_key("work", broker.namespace)
+        ek = dlq_expiry_key("work", broker.namespace)
+        id1 = redis_client.xadd(dk, {"data": b"x"})
+        id2 = redis_client.xadd(dk, {"data": b"y"})
+        id1 = id1.decode() if isinstance(id1, bytes) else id1
+        id2 = id2.decode() if isinstance(id2, bytes) else id2
+        now = int(time.time() * 1000)
+        redis_client.zadd(ek, {id1: now - 1000})    # past due
+        redis_client.zadd(ek, {id2: now + 60000})   # future
+
+        DelayedScheduler(broker)._expire_dead_letters()
+
+        remaining = {(e[0].decode() if isinstance(e[0], bytes) else e[0])
+                     for e in redis_client.xrange(dk)}
+        assert id1 not in remaining and id2 in remaining   # only past-due deleted
+        assert redis_client.zcard(ek) == 1                 # index pruned too
+
+
+# ---------------------------------------------------------------------------
 # Stale-consumer reaper
 # ---------------------------------------------------------------------------
 
@@ -151,6 +180,26 @@ class TestConsumerReaper:
         assert reaped == 0
         assert name in _consumer_names(redis_client, "work")
         consumer.ack(msg)
+        consumer.close()
+
+    def test_reaps_drained_abandoned_sentinel_regardless_of_idle(self, broker, redis_client):
+        """Once drained, the abandoned sentinel is reaped even though it hasn't
+        been idle long — unlike a real (quiet) worker."""
+        broker.declare_queue("work")
+        broker.enqueue(make_message(queue="work"))
+        sk = stream_key("work", broker.namespace)
+        consumer = broker.consume("work", prefetch=1, timeout=500)
+        msg = next(consumer)
+        # Create the sentinel (recently active), then drain its pending.
+        redis_client.xclaim(sk, GROUP_NAME, ABANDONED_CONSUMER, 0,
+                            [msg._redis_stream_id], justid=True)
+        redis_client.xack(sk, GROUP_NAME, msg._redis_stream_id)
+        assert ABANDONED_CONSUMER in _consumer_names(redis_client, "work")
+
+        # A 1h threshold spares quiet real workers but not the drained sentinel.
+        sched = DelayedScheduler(broker, reap_min_idle=3_600_000)
+        sched._reap_consumers()
+        assert ABANDONED_CONSUMER not in _consumer_names(redis_client, "work")
         consumer.close()
 
     def test_does_not_reap_recently_active_consumer(self, broker, redis_client):

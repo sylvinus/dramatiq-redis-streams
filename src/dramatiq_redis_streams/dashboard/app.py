@@ -187,6 +187,19 @@ class DashboardApp:
         )
         return self._json_response(start_response, 200, data)
 
+    def _worker_pending(self, environ, start_response, name=""):
+        # Seek-paginated drill-down into one worker's pending tasks. Each page
+        # is bounded by `count` (same hard ceiling as other listings), and the
+        # `after` cursor resumes without re-scanning what came before.
+        count = self._int_param(environ, "count", _DEFAULT_MESSAGE_COUNT, _MAX_MESSAGE_COUNT)
+        qs = parse_qs(environ.get("QUERY_STRING", ""))
+        after = qs.get("after", [None])[0]
+        data = api.get_worker_pending(
+            self._client, self._namespace, name, self._declared,
+            after=after, count=count,
+        )
+        return self._json_response(start_response, 200, data)
+
 
 def _r(method, pattern, handler):
     return (method, re.compile(pattern + "$"), handler)
@@ -205,4 +218,5 @@ _ROUTES = [
     _r("POST", r"/api/queues/(?P<name>[^/]+)/flush", DashboardApp._flush),
     _r("POST", r"/api/queues/(?P<name>[^/]+)/remove", DashboardApp._remove),
     _r("GET", "/api/workers", DashboardApp._workers),
+    _r("GET", r"/api/workers/(?P<name>[^/]+)/pending", DashboardApp._worker_pending),
 ]

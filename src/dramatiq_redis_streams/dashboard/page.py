@@ -38,8 +38,11 @@ HTML_PAGE = """\
          font-size: 12px; cursor: pointer; font-weight: 500; }
   .btn-primary { background: #0984e3; color: #fff; }
   .btn-danger { background: #d63031; color: #fff; }
+  .btn-light { background: #dfe6e9; color: #2d3436; }
   .btn:hover { opacity: .85; }
   .btn + .btn { margin-left: 6px; }
+  .pending-more { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
+  .pending-count { font-size: 12px; color: #636e72; }
   .empty { text-align: center; padding: 40px; color: #636e72; }
   h2 { font-size: 16px; margin-bottom: 12px; }
   .breadcrumb { font-size: 13px; margin-bottom: 12px; color: #636e72; }
@@ -59,10 +62,10 @@ HTML_PAGE = """\
   .worker-meta span { display: inline-flex; align-items: center; gap: 4px; }
   .pending-table { margin-top: 8px; }
   .pending-table table { margin-bottom: 0; }
-  .help { display: inline-block; width: 14px; height: 14px; line-height: 14px;
-          text-align: center; border-radius: 50%; background: #cdd6da; color: #485460;
-          font-size: 10px; font-weight: 700; cursor: help; margin-left: 4px;
-          font-style: normal; vertical-align: middle; }
+  .help { display: inline-flex; align-items: center; justify-content: center;
+          width: 14px; height: 14px; line-height: 1; border-radius: 50%;
+          background: #cdd6da; color: #485460; font-size: 10px; font-weight: 700;
+          cursor: help; margin-left: 4px; font-style: normal; vertical-align: middle; }
   .stat-card .label .help { background: #e6ebee; }
 </style>
 </head>
@@ -101,6 +104,12 @@ HTML_PAGE = """\
   var autoRefresh = document.getElementById('autoRefresh');
   var lastUpdate = document.getElementById('lastUpdate');
   var timer = null;
+  // How many pending rows the user has expanded per worker, so an auto-refresh
+  // restores that depth instead of collapsing back to the first page.
+  var pendingExpanded = {};
+  // Rows per "Load more" click — matches the first page so each click adds a
+  // consistent chunk (the initial page is the server's pending_limit, also 20).
+  var PENDING_PAGE = 20;
 
   function api(path, opts) {
     return fetch(BASE + path, opts || {}).then(function(r) { return r.json(); });
@@ -248,6 +257,7 @@ HTML_PAGE = """\
     h += '<th>Task' + help('The dramatiq actor (task function) to run.') + '</th>';
     h += '<th>Args</th><th>Kwargs</th>';
     h += '<th>Enqueued' + help('When the message was created.') + '</th>';
+    if (isDlq) h += '<th>Error' + help('Why it failed — the last line is shown; hover for the full traceback. The count is how many times it was retried before giving up.') + '</th>';
     if (isDlq) h += '<th>Actions</th>';
     h += '</tr>';
     msgs.forEach(function(m) {
@@ -258,6 +268,15 @@ HTML_PAGE = """\
       h += '<td class="mono">' + esc(JSON.stringify(m.kwargs)) + '</td>';
       h += '<td>' + fmtTime(m.timestamp) + '</td>';
       if (isDlq) {
+        var err = (m.error || '').replace(/\\s+$/, '');
+        var lines = err ? err.split('\\n') : [];
+        var summary = lines.length ? lines[lines.length - 1] : '';
+        var rc = (m.retries !== null && m.retries !== undefined)
+          ? ' <span style="color:#636e72">(retried ' + m.retries + '&times;)</span>' : '';
+        h += '<td class="mono" style="max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"' +
+             (err ? ' title="' + escAttr(err) + '"' : '') + '>' +
+             (summary ? '<span style="color:#d63031">' + esc(summary) + '</span>'
+                      : '<span style="color:#b2bec3">&mdash;</span>') + rc + '</td>';
         h += '<td>';
         h += '<button class="btn btn-primary" data-action="requeue" data-queue="' + escAttr(queue) + '" data-id="' + escAttr(m.id) + '">Requeue</button>';
         h += '<button class="btn btn-danger" data-action="delete" data-queue="' + escAttr(queue) + '" data-id="' + escAttr(m.id) + '">Delete</button>';
@@ -301,6 +320,15 @@ HTML_PAGE = """\
     return h + 'h ' + (m % 60) + 'm';
   }
 
+  // Messages abandoned at shutdown are stamped with a ~31-year idle so the next
+  // worker reclaims them; show that, not an absurd duration.
+  function fmtHeld(ms) {
+    if (ms >= 1e11) {
+      return '<span style="color:#636e72" title="Abandoned at shutdown — awaiting reclaim by another worker">abandoned</span>';
+    }
+    return fmtIdle(ms);
+  }
+
   function statusBadge(status) {
     var cls = status === 'active' ? 'badge-green' : status === 'idle' ? 'badge-orange' : 'badge-gray';
     var tip = status === 'active' ? 'Checked in within the last minute.'
@@ -310,7 +338,7 @@ HTML_PAGE = """\
   }
 
   function renderWorkerCard(w) {
-    var h = '<div class="worker-card">';
+    var h = '<div class="worker-card" data-worker="' + escAttr(w.name) + '">';
     h += '<h3><span class="mono">' + esc(w.name) + '</span> ' + statusBadge(w.status) + '</h3>';
     h += '<div class="worker-meta">';
     h += '<span>Last seen: <strong>' + fmtIdle(w.idle_ms) + ' ago</strong>' + help('Time since this worker last contacted Redis (a liveness heartbeat). Stays low while the worker is alive, even when it is busy or has a large backlog.') + '</span>';
@@ -326,29 +354,113 @@ HTML_PAGE = """\
     if (w.pending_messages.length) {
       h += '<div class="pending-table">';
       h += '<div style="font-size:12px;color:#636e72;margin:8px 0 4px">Tasks in progress on this worker:</div>';
-      h += '<table><tr>';
+      h += '<table><thead><tr>';
       h += '<th>ID' + help('Redis stream entry ID for this message.') + '</th>';
       h += '<th>Queue</th><th>Task</th>';
       h += '<th>Running for' + help('Time since this task was delivered to the worker — roughly how long it has been running.') + '</th>';
-      h += '<th>Attempts' + help('How many times this task has been delivered to a worker. More than 1 means it was retried after a worker failed to finish it in time — look for slow tasks or crashes.') + '</th></tr>';
-      w.pending_messages.forEach(function(pm) {
-        h += '<tr>';
-        h += '<td class="mono">' + esc(pm.id) + '</td>';
-        h += '<td>' + esc(pm.queue) + '</td>';
-        h += '<td>' + esc(pm.actor) + '</td>';
-        h += '<td>' + fmtIdle(pm.idle_ms) + '</td>';
-        h += '<td>' + (pm.deliveries > 1 ? '<strong style="color:#e17055">' + pm.deliveries + '</strong>' : pm.deliveries) + '</td>';
-        h += '</tr>';
-      });
-      h += '</table>';
+      h += '<th>Attempts' + help('How many times this task has been delivered to a worker. More than 1 means it was retried after a worker failed to finish it in time — look for slow tasks or crashes.') + '</th></tr></thead><tbody>';
+      w.pending_messages.forEach(function(pm) { h += pendingRow(pm); });
+      h += '</tbody></table>';
       if (w.total_pending > w.pending_messages.length) {
-        h += '<div style="font-size:12px;color:#636e72;margin-top:6px">Showing ' +
-             w.pending_messages.length + ' of ' + w.total_pending + ' in-progress tasks.</div>';
+        h += '<div class="pending-more">';
+        if (w.pending_cursor) {
+          h += '<button class="btn btn-light" data-action="loadPending" data-worker="' +
+               escAttr(w.name) + '" data-cursor="' + escAttr(w.pending_cursor) +
+               '" data-total="' + w.total_pending + '">Load more</button>';
+        }
+        h += '<span class="pending-count">Showing ' + w.pending_messages.length +
+             ' of ' + w.total_pending + ' in-progress tasks.</span>';
+        h += '</div>';
       }
       h += '</div>';
     }
     h += '</div>';
     return h;
+  }
+
+  // One row of a worker's pending-task table. Shared by the initial render and
+  // by the "Load more" append, so both stay identical.
+  function pendingRow(pm) {
+    return '<tr>' +
+      '<td class="mono">' + esc(pm.id) + '</td>' +
+      '<td>' + esc(pm.queue) + '</td>' +
+      '<td>' + esc(pm.actor) + '</td>' +
+      '<td>' + fmtHeld(pm.idle_ms) + '</td>' +
+      '<td>' + (pm.deliveries > 1 ? '<strong style="color:#e17055">' + pm.deliveries + '</strong>' : pm.deliveries) + '</td>' +
+      '</tr>';
+  }
+
+  function fetchPending(name, cursor, count) {
+    var qs = '?after=' + encodeURIComponent(cursor) + (count ? '&count=' + count : '');
+    return api('/api/workers/' + encodeURIComponent(name) + '/pending' + qs);
+  }
+
+  // Find a worker's pending-table wrapper by name without building a CSS
+  // selector from the (untrusted) name.
+  function findPendingWrap(name) {
+    var cards = app.querySelectorAll('.worker-card');
+    for (var i = 0; i < cards.length; i++) {
+      if (cards[i].dataset.worker === name) return cards[i].querySelector('.pending-table');
+    }
+    return null;
+  }
+
+  // Append one fetched page into a worker's table; advance or retire the button
+  // and refresh the "Showing N of M" counter.
+  function appendPendingPage(wrap, data) {
+    var tbody = wrap.querySelector('tbody');
+    var btn = wrap.querySelector('button[data-action="loadPending"]');
+    if (tbody && data.messages) {
+      data.messages.forEach(function(pm) { tbody.insertAdjacentHTML('beforeend', pendingRow(pm)); });
+    }
+    if (btn) {
+      if (data.next_cursor) { btn.dataset.cursor = data.next_cursor; btn.disabled = false; }
+      else { btn.remove(); }  // reached the end
+      var countEl = wrap.querySelector('.pending-count');
+      if (countEl && tbody) {
+        countEl.textContent = 'Showing ' + tbody.querySelectorAll('tr').length +
+          ' of ' + btn.dataset.total + ' in-progress tasks.';
+      }
+    }
+  }
+
+  // Manual "Load more": one page, and remember the new depth so an auto-refresh
+  // re-expands to here instead of collapsing.
+  function loadMorePending(btn) {
+    var wrap = btn.closest('.pending-table'), name = btn.dataset.worker;
+    if (!wrap || !btn.dataset.cursor) return;
+    btn.disabled = true;
+    fetchPending(name, btn.dataset.cursor, PENDING_PAGE).then(function(data) {
+      appendPendingPage(wrap, data);
+      pendingExpanded[name] = wrap.querySelectorAll('tbody tr').length;
+    }).catch(function() { btn.disabled = false; });
+  }
+
+  // Restore a previously-expanded depth after a full re-render, paging until the
+  // table holds `target` rows again (or the worker has no more pending tasks).
+  function fillPendingTo(wrap, name, target) {
+    var tbody = wrap.querySelector('tbody');
+    var btn = wrap.querySelector('button[data-action="loadPending"]');
+    if (!tbody || !btn || !btn.dataset.cursor) return;
+    var before = tbody.querySelectorAll('tr').length;
+    if (before >= target) return;
+    btn.disabled = true;
+    fetchPending(name, btn.dataset.cursor, Math.min(target - before, 200)).then(function(data) {
+      appendPendingPage(wrap, data);
+      // Continue only while making progress and a cursor remains (no infinite loop).
+      if (tbody.querySelectorAll('tr').length > before &&
+          wrap.querySelector('button[data-action="loadPending"]')) {
+        fillPendingTo(wrap, name, target);
+      }
+    }).catch(function() {});
+  }
+
+  // After (re)rendering the workers view, re-open whatever the user had expanded.
+  function applyPendingExpansions() {
+    Object.keys(pendingExpanded).forEach(function(name) {
+      var wrap = findPendingWrap(name);
+      if (wrap) fillPendingTo(wrap, name, pendingExpanded[name]);
+    });
   }
 
   function renderWorkers(workers) {
@@ -397,6 +509,7 @@ HTML_PAGE = """\
     } else if (hash === '#/workers') {
       api('/api/workers').then(function(data) {
         app.innerHTML = renderWorkers(data);
+        applyPendingExpansions();
       });
     } else if (hash === '#/delayed') {
       api('/api/delayed').then(function(data) {
@@ -446,6 +559,7 @@ HTML_PAGE = """\
       case 'requeueAll': requeueAllDlq(q); break;
       case 'requeue': requeueMsg(q, id); break;
       case 'delete': deleteMsg(q, id); break;
+      case 'loadPending': loadMorePending(btn); break;
     }
   });
 

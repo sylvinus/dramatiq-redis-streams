@@ -4,7 +4,7 @@ import dramatiq
 import pytest
 
 from dramatiq_redis_streams import StreamsBroker
-from dramatiq_redis_streams.keys import GROUP_NAME, dlq_stream_key, queues_key, stream_key
+from dramatiq_redis_streams.keys import GROUP_NAME, dlq_expiry_key, dlq_stream_key, queues_key, stream_key
 
 from .conftest import make_message
 
@@ -56,6 +56,152 @@ class TestConsumerRead:
                 received.append(proxy.args[0])
 
         assert len(received) == 5
+        consumer.close()
+
+    @pytest.mark.timeout(10)
+    def test_respects_prefetch_limit(self, broker, redis_client):
+        """A worker reserves at most `prefetch` messages; the rest stay
+        available for other workers (so scaling out actually works)."""
+        for i in range(5):
+            broker.enqueue(make_message(args=(i,)))
+
+        consumer = broker.consume("test-queue", prefetch=2, timeout=100)
+        got = []
+        for _ in range(3):  # 2 messages, then one None at the prefetch limit
+            m = next(consumer)
+            if m is not None:
+                got.append(m)
+        assert len(got) == 2  # only prefetch reserved, not the whole queue
+
+        # A second worker can still pick up the remaining 3.
+        broker2 = StreamsBroker(client=redis_client, middleware=[])
+        broker2.broker_id = "worker-2"
+        c2 = broker2.consume("test-queue", prefetch=10, timeout=100)
+        got2 = []
+        for _ in range(4):
+            m = next(c2)
+            if m is not None:
+                got2.append(m)
+        assert len(got2) == 3
+
+        consumer.close()
+        c2.close()
+
+    def test_close_abandons_buffered_for_immediate_reclaim(self, broker, redis_client):
+        """Clean shutdown marks prefetched-but-unstarted messages maximally idle
+        so the next worker reclaims them at once (ahead of the backlog), instead
+        of leaving them to wait out their reclaim deadline."""
+        for i in range(3):
+            broker.enqueue(make_message(args=(i,)))
+        consumer = broker.consume("test-queue", prefetch=3, timeout=100)
+        first = next(consumer)            # reads all 3 into buffer, returns 1
+        assert first is not None          # 2 remain buffered, unhanded
+        consumer.close()                  # abandons those 2 (XCLAIM, huge idle)
+
+        # Another worker's reclaim sweep grabs them immediately, despite the
+        # task deadline being far in the future.
+        broker2 = StreamsBroker(client=redis_client, middleware=[])
+        broker2.broker_id = "worker-2"
+        c2 = broker2.consume("test-queue", prefetch=10, timeout=100)
+        c2.reclaim_min_idle = 0
+        c2._reclaim_orphans()
+
+        got = []
+        while c2._buffer:
+            got.append(c2._buffer.pop(0))
+        assert sorted(m.args[0] for m in got) == [1, 2]
+        c2.close()
+
+    def test_abandoned_reclaimable_by_same_worker_name(self, broker, redis_client):
+        """dramatiq also calls close() on the error path, then recreates a
+        consumer with the SAME name. Abandoned messages must still be reclaimable
+        by it — so they're owned by a sentinel, not the worker (which would skip
+        its own pending)."""
+        for i in range(3):
+            broker.enqueue(make_message(args=(i,)))
+        c1 = broker.consume("test-queue", prefetch=3, timeout=100)
+        assert next(c1) is not None       # returns args=0; buffer = args [1, 2]
+        c1.close()                        # abandons [1, 2]
+
+        # Same broker id → same consumer name as c1.
+        c2 = broker.consume("test-queue", prefetch=10, timeout=100)
+        assert c2._consumer_name == c1._consumer_name
+        c2.reclaim_min_idle = 0
+        c2._reclaim_orphans()
+
+        got = []
+        while c2._buffer:
+            got.append(c2._buffer.pop(0))
+        assert sorted(m.args[0] for m in got) == [1, 2]
+        c2.close()
+
+    def test_zero_prefetch_does_not_wedge(self, broker):
+        """A non-positive prefetch is clamped to 1, never stuck at zero room."""
+        broker.enqueue(make_message(args=(1,)))
+        consumer = broker.consume("test-queue", prefetch=0, timeout=100)
+        assert consumer.prefetch == 1
+        m = next(consumer)
+        assert m is not None
+        consumer.ack(m)
+        consumer.close()
+
+    def test_nack_frees_prefetch_capacity(self, broker):
+        """nack releases a slot just like ack."""
+        for i in range(2):
+            broker.enqueue(make_message(args=(i,)))
+        consumer = broker.consume("test-queue", prefetch=1, timeout=100)
+        m1 = next(consumer)
+        assert next(consumer) is None     # at capacity
+        consumer.nack(m1)                 # → DLQ, and frees the slot
+        m2 = next(consumer)
+        assert m2 is not None and m2.args != m1.args
+        consumer.ack(m2)
+        consumer.close()
+
+    def test_requeue_frees_prefetch_capacity(self, broker):
+        """requeue releases the slots of the messages it returns."""
+        broker.enqueue(make_message(args=(1,)))
+        broker.enqueue(make_message(args=(2,)))
+        consumer = broker.consume("test-queue", prefetch=1, timeout=100)
+        m1 = next(consumer)
+        assert next(consumer) is None     # at capacity
+        consumer.requeue([m1])            # frees the slot
+        m = next(consumer)
+        assert m is not None
+        consumer.ack(m)
+        consumer.close()
+
+    def test_inherits_pending_on_restart(self, broker, redis_client):
+        """A recreated consumer (same worker id) accounts for the PEL it
+        inherits, so the prefetch limit stays correct across restarts."""
+        for i in range(3):
+            broker.enqueue(make_message(args=(i,)))
+        c1 = broker.consume("test-queue", prefetch=3, timeout=100)
+        held = [next(c1) for _ in range(3)]
+        assert all(m is not None for m in held)  # c1 now holds 3 in its PEL
+
+        # Simulate a restart: a fresh consumer for the same worker.
+        c2 = broker.consume("test-queue", prefetch=3, timeout=100)
+        assert c2._unacked == 3  # inherited the PEL, won't over-reserve
+
+        for m in held:
+            c1.ack(m)
+        c1.close()
+        c2.close()
+
+    def test_ack_frees_prefetch_capacity(self, broker):
+        """Acking a message lets the worker reserve another (capacity reopens)."""
+        for i in range(3):
+            broker.enqueue(make_message(args=(i,)))
+        consumer = broker.consume("test-queue", prefetch=1, timeout=100)
+
+        m1 = next(consumer)
+        assert m1 is not None
+        assert next(consumer) is None  # at capacity (prefetch=1), nothing more
+        consumer.ack(m1)
+        m2 = next(consumer)  # slot freed → next message delivered
+        assert m2 is not None and m2.args != m1.args
+        consumer.ack(m2)
         consumer.close()
 
     def test_has_redis_stream_id(self, broker):
@@ -129,6 +275,88 @@ class TestConsumerNack:
         raw = entries[0][1].get(b"data") or entries[0][1].get("data")
         dead = dramatiq.Message.decode(raw)
         assert dead.args == ("bad-payload",)
+        consumer.close()
+
+    def _dead_message(self, redis_client, queue="test-queue"):
+        entries = redis_client.xrange(dlq_stream_key(queue))
+        raw = entries[0][1].get(b"data") or entries[0][1].get("data")
+        return dramatiq.Message.decode(raw)
+
+    def test_keeps_existing_traceback(self, broker, redis_client):
+        """A traceback already recorded by Retries rides along to the DLQ."""
+        msg = make_message()
+        msg.options["traceback"] = "ValueError: boom"
+        broker.enqueue(msg)
+        consumer = broker.consume("test-queue", timeout=1000)
+        consumer.nack(next(consumer))
+        assert self._dead_message(redis_client).options.get("traceback") == "ValueError: boom"
+        consumer.close()
+
+    def test_records_exception_when_no_traceback(self, broker, redis_client):
+        """Fallback (e.g. ActorNotFound): the stuffed exception is recorded."""
+        broker.enqueue(make_message())
+        consumer = broker.consume("test-queue", timeout=1000)
+        proxy = next(consumer)
+        proxy.stuff_exception(ValueError("kaboom"))   # no options["traceback"]
+        consumer.nack(proxy)
+        assert "kaboom" in self._dead_message(redis_client).options.get("traceback")
+        consumer.close()
+
+    def test_truncates_huge_traceback(self, broker, redis_client):
+        """A failure reason can't balloon the DLQ entry."""
+        msg = make_message()
+        msg.options["traceback"] = "X" * 50000
+        broker.enqueue(msg)
+        consumer = broker.consume("test-queue", timeout=1000)
+        consumer.nack(next(consumer))
+        tb = self._dead_message(redis_client).options.get("traceback")
+        assert len(tb) < 9000   # hard-capped (8192 + truncation marker)
+        consumer.close()
+
+    def test_schedules_expiry_from_message_ttl(self, broker, redis_client):
+        """A per-message dead_message_ttl indexes the dead-letter for deletion."""
+        msg = make_message()
+        msg.options["dead_message_ttl"] = 60000
+        broker.enqueue(msg)
+        consumer = broker.consume("test-queue", timeout=1000)
+        consumer.nack(next(consumer))
+        assert redis_client.zcard(dlq_expiry_key("test-queue", broker.namespace)) == 1
+        consumer.close()
+
+    def test_default_ttl_applies(self, broker, redis_client):
+        """With no per-task value, the broker default (7 days) is used."""
+        broker.enqueue(make_message())
+        consumer = broker.consume("test-queue", timeout=1000)
+        consumer.nack(next(consumer))
+        ek = dlq_expiry_key("test-queue", broker.namespace)
+        assert redis_client.zcard(ek) == 1
+        score = redis_client.zrange(ek, 0, 0, withscores=True)[0][1]
+        assert score > time.time() * 1000 + 6 * 86_400_000   # ~7 days out
+        consumer.close()
+
+    def test_zero_ttl_keeps_forever(self, broker, redis_client):
+        """dead_message_ttl=0 opts out of expiry even when a default is set."""
+        msg = make_message()
+        msg.options["dead_message_ttl"] = 0
+        broker.enqueue(msg)
+        consumer = broker.consume("test-queue", timeout=1000)
+        consumer.nack(next(consumer))
+        assert redis_client.zcard(dlq_expiry_key("test-queue", broker.namespace)) == 0
+        consumer.close()
+
+    def test_dead_message_ttl_from_actor_option(self, broker, redis_client):
+        """`@actor(dead_message_ttl=...)` is accepted and resolved at nack time."""
+        dramatiq.set_broker(broker)
+
+        @dramatiq.actor(queue_name="test-queue", dead_message_ttl=120000)
+        def boom():
+            pass
+
+        assert "dead_message_ttl" in broker.actor_options
+        broker.enqueue(boom.message())
+        consumer = broker.consume("test-queue", timeout=1000)
+        consumer.nack(next(consumer))
+        assert redis_client.zcard(dlq_expiry_key("test-queue", broker.namespace)) == 1
         consumer.close()
 
 
@@ -259,6 +487,27 @@ class TestConsumerReclaim:
         live.close()
 
     @pytest.mark.timeout(10)
+    def test_reclaim_purges_deleted_pending_entry(self, broker, redis_client):
+        """A pending entry whose payload was deleted from the stream (e.g.
+        trimmed) is purged from the PEL by the reclaim sweep, so it can't leave
+        the owning consumer permanently un-reapable."""
+        broker.enqueue(make_message(args=(1,)))
+        sk = stream_key("test-queue", broker.namespace)
+        c1 = broker.consume("test-queue", prefetch=1, timeout=100)
+        m = next(c1)                                   # delivered → in c1's PEL
+        redis_client.xdel(sk, m._redis_stream_id)      # gone from stream, still pending
+        c1._closed = True
+
+        broker2 = StreamsBroker(client=redis_client, middleware=[])
+        broker2.broker_id = "worker-2"
+        c2 = broker2.consume("test-queue", prefetch=10, timeout=100)
+        c2.reclaim_min_idle = 0
+        c2._reclaim_orphans()
+
+        assert c2._buffer == []                        # nothing to process
+        assert redis_client.xpending(sk, GROUP_NAME)["pending"] == 0  # PEL purged
+        c2.close()
+
     def test_does_not_reclaim_own_overdue_message(self, broker, redis_client):
         """A worker must never re-claim its OWN in-flight message, even when it
         has overrun its deadline — that would double-run the task."""

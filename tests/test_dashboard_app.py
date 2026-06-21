@@ -252,6 +252,40 @@ class TestWorkersAPI:
         assert status == 200
         assert json.loads(body) == []
 
+    def test_worker_pending_pagination_route(self, broker):
+        """GET /api/workers/<name>/pending pages through the worker's PEL."""
+        broker.declare_queue("work")
+        for i in range(5):
+            broker.enqueue(make_message(queue="work", actor=f"a{i}"))
+        consumer = broker.consume("work", prefetch=5, timeout=1000)
+        msgs = [next(consumer) for _ in range(5)]
+        app = DashboardApp(broker)
+
+        # Discover the worker name from the workers listing.
+        _s, _h, body = _request(app, "GET", "/api/workers")
+        wname = next(w["name"] for w in json.loads(body) if w["name"].startswith("worker-"))
+
+        seen, cursor = [], None
+        while True:
+            query = "count=2" + (f"&after={cursor}" if cursor else "")
+            status, headers, body = _request(
+                app, "GET", f"/api/workers/{wname}/pending", query=query,
+            )
+            assert status == 200
+            assert headers["Content-Type"] == "application/json"
+            data = json.loads(body)
+            seen.extend(m["id"] for m in data["messages"])
+            cursor = data["next_cursor"]
+            if cursor is None:
+                break
+
+        assert len(seen) == 5
+        assert len(set(seen)) == 5
+
+        for m in msgs:
+            consumer.ack(m)
+        consumer.close()
+
 
 class TestRouting:
     def test_404_for_unknown_route(self, broker):

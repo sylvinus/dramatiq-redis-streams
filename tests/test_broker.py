@@ -49,14 +49,18 @@ class TestDeclareQueue:
 
 
 class TestTaskTimeout:
-    def test_default_time_limit_aligns_timelimit_middleware(self, redis_client):
-        """default_time_limit drives dramatiq's in-worker TimeLimit abort too."""
+    def test_default_stack_tracks_dramatiq_timelimit(self, redis_client):
+        """The default TimeLimit is left at dramatiq's 10-minute default (not
+        mutated), and the reclaim deadline tracks it — a drop-in broker swap
+        changes no timeout. default_time_limit is ignored while a TimeLimit
+        exists."""
         from dramatiq.middleware import TimeLimit
 
         b = StreamsBroker(client=redis_client, default_time_limit=12345)
         try:
             tl = next(m for m in b.middleware if isinstance(m, TimeLimit))
-            assert tl.time_limit == 12345
+            assert tl.time_limit == 600000          # dramatiq default, untouched
+            assert b.default_time_limit == 600000   # reclaim follows it, not 12345
         finally:
             b.close()
 

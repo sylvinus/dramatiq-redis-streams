@@ -5,7 +5,14 @@ import time
 import dramatiq
 import redis as redis_mod
 
-from .keys import GROUP_NAME, delayed_key, stream_key
+from .keys import (
+    ABANDONED_CONSUMER,
+    GROUP_NAME,
+    delayed_key,
+    dlq_expiry_key,
+    dlq_stream_key,
+    stream_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +34,7 @@ class DelayedScheduler(threading.Thread):
         reap_interval: Milliseconds between stale-consumer sweeps (default 60 000).
         reap_min_idle: Minimum consumer idle time, in milliseconds, before a
             drained consumer is removed (default 1 hour).
+        dlq_expire_batch: Max expired dead-letters deleted per queue per sweep.
     """
 
     def __init__(
@@ -37,6 +45,7 @@ class DelayedScheduler(threading.Thread):
         batch_size=100,
         reap_interval=60000,
         reap_min_idle=3_600_000,
+        dlq_expire_batch=1000,
     ):
         super().__init__(daemon=True, name="DelayedScheduler")
         self.broker = broker
@@ -44,6 +53,7 @@ class DelayedScheduler(threading.Thread):
         self.batch_size = batch_size
         self.reap_interval = reap_interval
         self.reap_min_idle = reap_min_idle
+        self.dlq_expire_batch = dlq_expire_batch
         self._stop_event = threading.Event()
         self._last_reap = 0.0
 
@@ -100,17 +110,43 @@ class DelayedScheduler(threading.Thread):
         return moved
 
     def _maybe_reap(self):
-        """Run the stale-consumer sweep if ``reap_interval`` has elapsed."""
+        """Run the periodic maintenance sweeps if ``reap_interval`` elapsed."""
         now = time.monotonic()
         if now - self._last_reap < self.reap_interval / 1000:
             return
         self._last_reap = now
-        try:
-            self._reap_consumers()
-        except redis_mod.ConnectionError:
-            logger.warning("Redis connection lost while reaping consumers")
-        except Exception:
-            logger.warning("Consumer reaper error", exc_info=True)
+        for sweep in (self._reap_consumers, self._expire_dead_letters):
+            try:
+                sweep()
+            except redis_mod.ConnectionError:
+                logger.warning("Redis connection lost during periodic sweep")
+            except Exception:
+                logger.warning("Periodic sweep error", exc_info=True)
+
+    def _expire_dead_letters(self):
+        """Delete dead-lettered messages whose ``dead_message_ttl`` has elapsed.
+
+        Cheap and O(expired): an expiry sorted set is consulted by score, so
+        messages kept forever (no TTL) are never even looked at.
+        """
+        client = self.broker.client
+        namespace = self.broker.namespace
+        now = int(time.time() * 1000)
+        for queue_name in self.broker.get_declared_queues():
+            ek = dlq_expiry_key(queue_name, namespace)
+            try:
+                expired = client.zrangebyscore(ek, "-inf", now, start=0, num=self.dlq_expire_batch)
+            except redis_mod.ResponseError:
+                continue
+            if not expired:
+                continue
+            ids = [e.decode() if isinstance(e, bytes) else e for e in expired]
+            dk = dlq_stream_key(queue_name, namespace)
+            try:
+                client.xdel(dk, *ids)
+                client.zrem(ek, *ids)
+            except redis_mod.ResponseError:
+                pass
 
     def _reap_consumers(self):
         """Remove stale, fully-drained consumers from each stream's group.
@@ -144,11 +180,15 @@ class DelayedScheduler(threading.Thread):
             for c in consumers:
                 if c.get("pending", 0) != 0:
                     continue
-                if c.get("idle", 0) < self.reap_min_idle:
-                    continue
                 name = c.get("name", b"")
                 if isinstance(name, bytes):
                     name = name.decode()
+                # Real workers are kept until idle a long time (a quiet worker
+                # isn't dead). The abandoned sentinel, once drained, is reaped
+                # immediately — it's recreated on the next abandon and shouldn't
+                # linger as a phantom consumer.
+                if name != ABANDONED_CONSUMER and c.get("idle", 0) < self.reap_min_idle:
+                    continue
                 try:
                     client.xgroup_delconsumer(sk, GROUP_NAME, name)
                     reaped += 1

@@ -1,17 +1,37 @@
 import logging
+import os
 import threading
 import time
 import uuid
 
 import dramatiq
 import redis as redis_mod
-from dramatiq.middleware import TimeLimit
+from dramatiq.middleware import Middleware, TimeLimit
 
 from .consumer import StreamsConsumer
 from .delayed import DelayedScheduler
 from .keys import GROUP_NAME, delayed_key, queues_key, stream_key
 
 logger = logging.getLogger(__name__)
+
+# Lifetime of a dead-lettered message before auto-deletion. Matches dramatiq's
+# reference brokers (7 days) and honors the same environment variable.
+DEFAULT_DEAD_MESSAGE_TTL = int(os.getenv("dramatiq_dead_message_ttl", 86_400_000 * 7))
+
+
+class _DeadMessageTTLMiddleware(Middleware):
+    """Registers the ``dead_message_ttl`` actor option.
+
+    The dead-letter lifetime is implemented by the broker and scheduler (not by
+    a middleware hook), but dramatiq only lets a new ``@actor(...)`` option be
+    introduced through a middleware's ``actor_options``. This otherwise-inert
+    middleware is that registration — the idiomatic alternative to mutating
+    ``broker.actor_options`` directly.
+    """
+
+    @property
+    def actor_options(self):
+        return {"dead_message_ttl"}
 
 
 class StreamsBroker(dramatiq.Broker):
@@ -28,18 +48,23 @@ class StreamsBroker(dramatiq.Broker):
         client: Pre-configured ``redis.Redis`` instance.
         middleware: List of Dramatiq middleware. ``None`` for defaults.
         namespace: Key prefix for all Redis keys (default ``"dramatiq"``).
-        default_time_limit: Effective timeout (ms) for tasks that declare no
-            ``time_limit``. A single value with two effects: dramatiq's
-            ``TimeLimit`` middleware raises ``TimeLimitExceeded`` in the worker
-            at this point (only applied when ``middleware`` is left as defaults),
-            and a message unacked past this deadline is treated as orphaned and
-            re-delivered. Set ``time_limit`` per actor/message to override both.
-            Default 60 000 — deliberately tight, so a forgotten timeout surfaces.
+        default_time_limit: Reclaim-deadline fallback (ms) for a task that
+            declares no ``time_limit``, used **only** when the middleware stack
+            has no ``TimeLimit`` (i.e. no in-worker abort to stay in lock-step
+            with). Whenever a ``TimeLimit`` middleware is present — including the
+            default stack — the reclaim deadline tracks *its* limit instead, so
+            the two never diverge. Default 600 000 (10 min), matching dramatiq's
+            ``TimeLimit`` default; a drop-in broker swap keeps the same timeout.
         reclaim_grace: Extra ms beyond a task's deadline before its message is
             eligible for reclaim (default 10 000).
         reclaim_interval: Milliseconds between orphan-recovery sweeps
             (default 30 000). All broker time values are in milliseconds, as in
             dramatiq itself.
+        dead_message_ttl: Lifetime (ms) of a dead-lettered message before it is
+            auto-deleted (default 7 days, matching dramatiq; honors the
+            ``dramatiq_dead_message_ttl`` env var). Override per task with
+            ``@actor(dead_message_ttl=...)`` or ``send_with_options(...)``;
+            ``0`` keeps the message forever.
     """
 
     def __init__(
@@ -49,33 +74,34 @@ class StreamsBroker(dramatiq.Broker):
         client=None,
         middleware=None,
         namespace="dramatiq",
-        default_time_limit=60000,
+        default_time_limit=600000,
         reclaim_grace=10000,
         reclaim_interval=30000,
+        dead_message_ttl=DEFAULT_DEAD_MESSAGE_TTL,
     ):
         super().__init__(middleware=middleware)
         self.namespace = namespace
         self.queues = set()  # base class uses dict; brokers use set
         self.reclaim_grace = reclaim_grace
         self.reclaim_interval = reclaim_interval
+        self.dead_message_ttl = dead_message_ttl
+        # Allow `@actor(dead_message_ttl=...)` / send_with_options to override the
+        # dead-letter lifetime. Registered the idiomatic way — through a
+        # middleware's actor_options — not by mutating self.actor_options.
+        self.add_middleware(_DeadMessageTTLMiddleware())
 
         # Keep the reclaim deadline and dramatiq's in-worker TimeLimit abort in
         # lock-step, so a task without an explicit time_limit is aborted AND
-        # reclaimed at the same point — never one without the other.
+        # reclaimed at the same point — never one without the other. We *read*
+        # the configured TimeLimit rather than mutating it (a hidden,
+        # version-fragile side effect on a shared middleware instance). dramatiq's
+        # default TimeLimit is 600 000ms, so the out-of-the-box reclaim deadline
+        # already matches dramatiq — a drop-in broker swap changes nothing.
+        # default_time_limit is only the fallback when the stack has no TimeLimit.
         timelimit_mw = next((m for m in self.middleware if isinstance(m, TimeLimit)), None)
-        if middleware is None:
-            # We own the default middleware stack → impose our (tight) default.
-            if timelimit_mw is not None:
-                timelimit_mw.time_limit = default_time_limit
-            self.default_time_limit = default_time_limit
-        elif timelimit_mw is not None:
-            # Caller controls middleware → reclaim follows THEIR TimeLimit so
-            # the two can't diverge.
-            self.default_time_limit = timelimit_mw.time_limit
-        else:
-            # Caller supplied middleware with no TimeLimit (no in-worker abort);
-            # reclaim still falls back to default_time_limit.
-            self.default_time_limit = default_time_limit
+        self.default_time_limit = (
+            timelimit_mw.time_limit if timelimit_mw is not None else default_time_limit
+        )
 
         if client is not None:
             self.client = client
@@ -184,6 +210,7 @@ class StreamsBroker(dramatiq.Broker):
             reclaim_interval=self.reclaim_interval,
             default_time_limit=self.default_time_limit,
             reclaim_grace=self.reclaim_grace,
+            dead_message_ttl=self.dead_message_ttl,
         )
 
     def flush(self, queue_name):
